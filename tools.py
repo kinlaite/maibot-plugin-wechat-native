@@ -6,9 +6,9 @@
 
 from typing import Any, Dict, List, Optional
 
-import unicodedata
-
+import asyncio
 import secrets
+import unicodedata
 
 from .codec import is_group_thread
 from .config import NativeConfig
@@ -177,7 +177,6 @@ class WechatNativeTools:
 
         native = self._config
         client = self._client()
-        admin = self._admin_client()
         thread = str(thread or "").strip()
         target = str(message_id or "").strip()
         if target:
@@ -203,9 +202,64 @@ class WechatNativeTools:
         server_id = str(record.get("serverId") or "")
         if not server_id.isdigit():
             raise ValueError("目标消息缺少可撤回的服务端 ID，可能已过期")
-        operation = await admin.recall_message(target, server_id, secrets.token_hex(16))
-        self._plugin._store.recall(thread, server_id, target)
-        return {"success": True, "status": "recalled", "message_id": target, "operation": operation}
+        # 撤回走日常 Token：Native 只要求 send/login 权限，admin Token 用于群名等写操作。
+        operation = await client.recall_message(target, server_id, secrets.token_hex(16))
+        status, detail = await self._await_recall(client, operation)
+        if status == "recalled":
+            self._plugin._store.recall(thread, server_id, target)
+        return {
+            "success": status == "recalled",
+            "status": status,
+            "message_id": target,
+            "detail": detail,
+        }
+
+    async def _await_recall(
+        self, client: NativeClient, operation: Dict[str, Any]
+    ) -> tuple[str, Dict[str, Any]]:
+        """轮询撤回操作直到得出确定结论。
+
+        Native 受理撤回只代表排队成功，必须等到 remoteOutcome 为
+        accepted/confirmed 才算真正撤回，否则可能只是本地记录变更。
+
+        Args:
+            client: Native 客户端。
+            operation: 撤回接口返回的操作对象。
+
+        Returns:
+            tuple[str, Dict[str, Any]]: 状态与最后一次操作详情。
+        """
+
+        operation_id = str(operation.get("id") or "")
+        current = operation
+        for _ in range(20):
+            state = str(current.get("state") or "")
+            payload = current.get("result") if isinstance(current.get("result"), dict) else {}
+            remote = str(payload.get("remoteOutcome") or "")
+            if state == "succeeded" and remote in {"accepted", "confirmed"}:
+                return ("already_recalled" if payload.get("status") == "already_recalled" else "recalled"), current
+            if state == "failed":
+                code = str(payload.get("code") or remote or "unknown")
+                service_code = payload.get("serviceCode")
+                status = str(payload.get("status") or "")
+                if status == "not_eligible" or service_code == -430:
+                    raise ValueError(
+                        "微信拒绝了撤回：只能撤回发送后 2 分钟内的消息，"
+                        "超时后微信不再允许撤回"
+                    )
+                if remote in {"not_attempted", "rejected"}:
+                    raise ValueError(f"微信未执行撤回（{code}），该消息可能已过期或不允许撤回")
+                raise ValueError(f"撤回失败（{code}）")
+            if not operation_id:
+                break
+            await asyncio.sleep(0.5)
+            try:
+                current = await client.operation(operation_id)
+            except NativeAPIError:
+                break
+        payload = current.get("result") if isinstance(current.get("result"), dict) else {}
+        remote = str(payload.get("remoteOutcome") or "unknown")
+        raise ValueError(f"撤回结果未确认（remoteOutcome={remote}），请稍后在微信中确认")
 
     async def _latest_own_message(
         self, client: NativeClient, native: NativeConfig, thread: str
