@@ -27,6 +27,7 @@ from .codec import (
     segments_from_media,
 )
 from .config import MAX_PDF_BYTES, MAX_VOICE_BYTES, NativeConfig
+from .login import LoginSession, poll_login, start_login
 from .log import logger
 from .native_client import (
     MediaError,
@@ -63,6 +64,8 @@ class WeChatNativePlugin(MaiBotPlugin):
     config_widgets: ClassVar[List[ConfigWidget]] = [
         ConfigWidget(id="connection", kind="status", label="微信连接状态"),
         ConfigWidget(id="account", kind="status", label="微信账号"),
+        ConfigWidget(id="qrcode", kind="qrcode", label="微信扫码登录"),
+        ConfigWidget(id="start_login", kind="action", label="生成登录二维码"),
         ConfigWidget(id="reconnect", kind="action", label="重新连接"),
     ]
 
@@ -83,6 +86,7 @@ class WeChatNativePlugin(MaiBotPlugin):
         self._pending_source: Dict[str, Dict[str, str]] = {}
         self._admin_client: Optional[NativeClient] = None
         self._tools = WechatNativeTools(self)
+        self._login = LoginSession()
     async def on_load(self) -> None:
         """初始化持久化状态并按配置启动接收任务。"""
 
@@ -117,6 +121,11 @@ class WeChatNativePlugin(MaiBotPlugin):
     async def on_unload(self) -> None:
         """停止后台任务并释放连接。"""
 
+        login_task = self._login.task
+        if login_task is not None and not login_task.done():
+            login_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await login_task
         async with self._lifecycle_lock:
             await self._stop()
 
@@ -140,7 +149,7 @@ class WeChatNativePlugin(MaiBotPlugin):
             await self._sync_tool_visibility()
 
     async def get_config_widget_state(self) -> Dict[str, ConfigWidgetState]:
-        """返回插件管理页展示的连接状态。
+        """返回插件管理页展示的连接状态与扫码二维码。
 
         Returns:
             Dict[str, ConfigWidgetState]: 各配置控件的状态。
@@ -156,11 +165,75 @@ class WeChatNativePlugin(MaiBotPlugin):
             if configured
             else "请先填写 Native 服务地址与 Account ID"
         )
+        login = self._login
+        qr_state = ConfigWidgetState(
+            text=login.message,
+            tone=login.tone,
+            image=login.qr_image or None,
+            expires_at=login.expires_at or None,
+        )
         return {
             "connection": ConfigWidgetState(text=text, tone="success" if self._ready else "neutral"),
             "account": ConfigWidgetState(text=self._self_id or "尚未识别微信账号"),
+            "qrcode": qr_state,
+            "start_login": ConfigWidgetState(
+                text="" if login.running() else "",
+                disabled=login.running() or not self._login_client_ready(),
+            ),
             "reconnect": ConfigWidgetState(disabled=not configured),
         }
+
+    def _login_client_ready(self) -> bool:
+        """判断当前是否可以发起扫码登录。
+
+        Returns:
+            bool: 已填写服务地址与 Account ID 时返回 ``True``。
+        """
+
+        return bool(str(self.config.native.server_url or "").strip()) and bool(
+            str(self.config.native.account_id or "").strip()
+        )
+
+    async def _handle_start_login(self) -> None:
+        """发起扫码登录并开始轮询状态。"""
+
+        if not self._login_client_ready():
+            raise ValueError("请先填写 Native 服务地址与 Account ID，再生成二维码")
+        try:
+            native = NativeConfig.from_settings(
+                self.config.native, self.config.chat, self.config.media, self.config.tools, self.config.actions
+            )
+            # 扫码登录需要 login scope；日常 Token 通常具备该权限，admin Token 仅用于群管理等写操作。
+            token = native.load_token()
+        except ValueError as error:
+            raise ValueError(f"登录配置无效：{error}") from error
+        client = NativeClient(native.api_url, native.account_id, token)
+        await client.open()
+        try:
+            session = await start_login(client)
+        except NativeAPIError as error:
+            await client.close()
+            if error.status == 409 and error.code == "operation_in_progress":
+                raise ValueError(
+                    "该微信账号已有正在进行的登录操作；若账号已在线则无需扫码，"
+                    "如需重新登录请先在 Native 侧断开该账号"
+                ) from error
+            raise ValueError(f"Native 拒绝发起登录（HTTP {error.status}，{error.code or 'unknown'}）") from error
+        except Exception:
+            await client.close()
+            raise
+        old = self._login
+        if old.task is not None and not old.task.done():
+            old.task.cancel()
+        self._login = session
+
+        async def run() -> None:
+            try:
+                await poll_login(client, session)
+            finally:
+                await client.close()
+
+        session.task = asyncio.create_task(run(), name="wechat-native-login")
 
     async def on_config_widget_action(self, action_id: str) -> None:
         """处理配置页操作按钮。
@@ -172,6 +245,9 @@ class WeChatNativePlugin(MaiBotPlugin):
             ValueError: 收到未知控件 ID。
         """
 
+        if action_id == "start_login":
+            await self._handle_start_login()
+            return
         if action_id != "reconnect":
             raise ValueError(f"未知配置页操作: {action_id}")
         async with self._lifecycle_lock:
@@ -203,8 +279,8 @@ class WeChatNativePlugin(MaiBotPlugin):
             native.load_token()
             admin_token = native.load_admin_token()
         except ValueError as error:
-            self._status = f"配置无效：{error}"
-            logger.error("WeChat Native 配置无效: %s", error)
+            self._status = f"未启动：{error}"
+            logger.error("WeChat Native 配置无效，适配器未启动: %s", error)
             return
         self._native = native
         if admin_token:
