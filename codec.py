@@ -82,17 +82,32 @@ def event_timestamp(raw: Dict[str, Any]) -> str:
         str: 秒级浮点时间戳字符串。
     """
 
-    value = raw.get("createdAt")
-    if isinstance(value, str):
-        try:
-            from datetime import datetime
+    stamp = parse_timestamp(raw)
+    return str(stamp if stamp is not None else time.time())
 
-            stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            if stamp.tzinfo is not None:
-                return str(float(stamp.timestamp()))
-        except (ValueError, OverflowError):
-            pass
-    return str(time.time())
+
+def parse_timestamp(raw: Dict[str, Any]) -> Optional[float]:
+    """解析 Native 消息的时间戳。
+
+    Args:
+        raw: Native 消息对象。
+
+    Returns:
+        Optional[float]: 秒级时间戳；无法解析时返回 ``None``。
+    """
+
+    value = raw.get("createdAt")
+    if not isinstance(value, str):
+        return None
+    try:
+        from datetime import datetime
+
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, OverflowError):
+        return None
+    if stamp.tzinfo is None:
+        return None
+    return float(stamp.timestamp())
 
 
 def strip_leading_mentions(text: str) -> str:
@@ -171,6 +186,11 @@ def inbound(
     text_with_quote = body
     if quote is not None:
         quoted = str(quote.get("text") or "").strip()
+        if not quoted and quote.get("embeddedImage") is True:
+            # 被引用的是一条图片消息，Native 只给标记不给正文。
+            quoted = "[图片]"
+        if not quoted and str(quote.get("state") or "") != "embedded":
+            quoted = "[引用消息内容不可见]"
         if quoted:
             author = str(quote.get("senderName") or "").strip()
             prefix = f"[引用消息｜{author}]" if author else "[引用消息]"
@@ -179,12 +199,24 @@ def inbound(
         raw_segments.append({"type": "text", "data": text_with_quote})
     raw_segments.extend(segments)
     nickname = str(raw.get("senderName") or "").strip() or str(sender)
+    additional: Dict[str, Any] = {
+        "wechat_thread_id": thread,
+        "wechat_mentioned": bool(mentioned),
+    }
+    # 宿主私聊出站依赖 platform_io_target_user_id 决定接收者，群聊依赖
+    # platform_io_target_group_id；缺了这两个字段，机器人无法主动发起会话。
+    if group:
+        additional["platform_io_target_group_id"] = thread
+    else:
+        additional["platform_io_target_user_id"] = thread
     info: Dict[str, Any] = {
         "user_info": {"user_id": str(sender), "user_nickname": nickname},
-        "additional_config": {"wechat_thread_id": thread, "wechat_mentioned": bool(mentioned)},
+        "additional_config": additional,
     }
     if group:
-        info["group_info"] = {"group_id": thread, "group_name": group_name or thread}
+        # 群名为空是明确语义：适配器不知道群名，宿主会保留自己记录的名称。
+        # 不能拿 chatroom ID 冒充群名，否则会把 ID 写进宿主的聊天流名称。
+        info["group_info"] = {"group_id": thread, "group_name": group_name or ""}
     message = {
         "platform": PLATFORM,
         "account_id": account,
@@ -256,11 +288,15 @@ def outbound(
             raise ValueError("当前配置不允许发送群消息")
         target = str(group_info.get("group_id") or "").strip()
     else:
-        target = str(extra.get("platform_io_target_user_id") or "").strip()
+        # 私聊出站的 user_info 是机器人自身，真正的接收者在宿主的平台字段里。
+        target = str(
+            extra.get("platform_io_target_user_id") or extra.get("platform_io_target_group_id") or ""
+        ).strip()
     if not target:
         raise ValueError("缺少出站目标会话 ID")
     parts: List[Tuple[str, Any]] = []
     mentions: List[str] = []
+    all_members = False
     reply_id: Optional[str] = None
     for segment in message["raw_message"]:
         kind = segment.get("type")
@@ -274,9 +310,11 @@ def outbound(
             parts.append(("image", _segment_binary(segment, max_image_bytes, "图片")))
         elif kind == "voice":
             parts.append(("voice", _segment_binary(segment, MAX_VOICE_BYTES, "语音")))
-        elif kind == "at":
+        elif kind in {"at", "at_all"}:
             target_user = str(segment.get("target_user_id") or "").strip()
-            if target_user and target_user not in mentions:
+            if kind == "at_all" or target_user in {"all", "全体", "everyone"}:
+                all_members = True
+            elif target_user and target_user not in mentions:
                 mentions.append(target_user)
         elif kind == "reply":
             reply_id = str(segment.get("target_message_id") or "").strip() or reply_id
@@ -284,8 +322,14 @@ def outbound(
             raise ValueError(f"WeChat Native 暂不支持发送 {kind} 消息")
     if not parts:
         raise ValueError("没有可发送的消息内容")
-    if mentions and not is_group_thread(target):
+    if (mentions or all_members) and not is_group_thread(target):
         mentions = []
+        all_members = False
+    if all_members and mentions:
+        raise ValueError("不能同时 @全体成员 和 @个人")
+    if all_members:
+        # 用保留值表示 @全体成员，由发送层翻译成 Native 的 {"all": True}。
+        mentions = ["all"]
     if parts and not any(part[0] == "text" for part in parts) and (mentions or reply_id):
         raise ValueError("Native 媒体接口不支持引用或 @，请在消息中添加文本承载这些信息")
     return target, parts, mentions, reply_id
@@ -320,4 +364,9 @@ def segments_from_media(
         )
     if pdf_name and pdf_text:
         segments.append({"type": "text", "data": pdf_context_text(pdf_name, pdf_text)})
+    elif pdf_name:
+        # 提取不到正文时也要告知模型收到的是 PDF，避免消息被当成空消息。
+        segments.append(
+            {"type": "text", "data": f"{PDF_CONTEXT_MARKER}{pdf_name}]（无法提取正文，请让用户说明需求）"}
+        )
     return segments

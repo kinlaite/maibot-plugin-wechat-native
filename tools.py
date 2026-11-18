@@ -201,6 +201,9 @@ class WechatNativeTools:
             raise ValueError("目标消息不属于当前微信账号")
         if record.get("direction") != "outgoing":
             raise ValueError("只能撤回机器人自己发送的消息")
+        allowed = native.recall_allowed_threads
+        if allowed and thread not in allowed:
+            raise ValueError(f"会话 {thread} 不在撤回白名单内，已拒绝撤回")
         if record.get("recall") is not None:
             return {"success": True, "status": "already_recalled", "message_id": target}
         server_id = str(record.get("serverId") or "")

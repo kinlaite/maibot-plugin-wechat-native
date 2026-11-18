@@ -15,6 +15,7 @@ from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
 import asyncio
 import secrets
+import time
 
 from .codec import (
     DEFAULT_IMAGE_PROMPT,
@@ -24,6 +25,7 @@ from .codec import (
     is_group_thread,
     message_id,
     outbound,
+    parse_timestamp,
     segments_from_media,
     split_message_id,
 )
@@ -47,6 +49,9 @@ MEDIA_RETRY_SECONDS = 3
 GROUP_NAME_TTL_SECONDS = 600.0
 PENDING_SOURCE_LIMIT = 512
 CURSOR_PROBE_SECONDS = 4.0
+TIMESTAMP_TOLERANCE_BEHIND = 60.0
+TIMESTAMP_TOLERANCE_AHEAD = 300.0
+TIME_WARNING_INTERVAL = 60.0
 ALL_TOOL_NAMES = (
     "wechat_search_history",
     "wechat_group_info",
@@ -89,6 +94,7 @@ class WeChatNativePlugin(MaiBotPlugin):
         self._stopping = False
         self._pending_source: Dict[str, Dict[str, str]] = {}
         self._group_names: Dict[str, tuple[str, float]] = {}
+        self._last_time_warning = 0.0
         self._member_names: Dict[str, tuple[str, float]] = {}
         self._admin_client: Optional[NativeClient] = None
         self._tools = WechatNativeTools(self)
@@ -597,6 +603,18 @@ class WeChatNativePlugin(MaiBotPlugin):
         external_id = message_id(native.account_id, thread, str(raw["id"]))
         if store.message_status(external_id) is not None:
             return False
+        # 事件流积压或游标重置后补同步的旧消息不应触发回复；
+        # 这类消息很密集，日志按间隔限流，避免刷屏掩盖真正的问题。
+        if not _timestamp_acceptable(raw):
+            now = time.monotonic()
+            if now - self._last_time_warning >= TIME_WARNING_INTERVAL:
+                self._last_time_warning = now
+                logger.warning(
+                    "微信实时消息因时间异常被忽略: message=%s createdAt=%s（补同步的历史消息属正常）",
+                    raw.get("id"),
+                    raw.get("createdAt"),
+                )
+            return False
         if group:
             if native.group_reply_mode == "disabled":
                 return False
@@ -608,6 +626,16 @@ class WeChatNativePlugin(MaiBotPlugin):
                 and mentions.get("state") == "known"
                 and mentions.get("self") is True
             )
+            # 群聊里别人随手发的图片、文件与语音不是对机器人的请求，
+            # 只有被 @ 时才处理，否则会被无关内容触发回复。
+            raw_type = raw.get("type")
+            quote = raw.get("quote") if isinstance(raw.get("quote"), dict) else {}
+            direct_media = raw_type in {3, 34} or (
+                raw_type == 49 and raw.get("appMessageType") == 6
+            )
+            quoted_media = raw_type == 49 and raw.get("appMessageType") == 57 and bool(quote)
+            if (direct_media or quoted_media) and not mentioned:
+                return False
             if native.group_reply_mode == "mention" and not mentioned:
                 return False
         elif not native.enable_private_reply:
@@ -685,6 +713,56 @@ class WeChatNativePlugin(MaiBotPlugin):
             store.mark_message(external_id, "no_reply")
             logger.info("麦麦过滤或去重了微信消息: %s", external_id)
         return True
+
+    async def _load_quoted_media(
+        self,
+        native: NativeConfig,
+        raw: Dict[str, Any],
+        quoted: Dict[str, Any],
+        client: NativeClient,
+    ) -> tuple[List[bytes], Optional[bytes], str, str]:
+        """下载被引用消息里的媒体。
+
+        引用预览只给标记不给正文，必须按 ``serverId`` 反查同会话的原消息，
+        校验身份后再读取媒体，避免把别的会话内容混进来。
+
+        Args:
+            native: 当前连接配置。
+            raw: 引用方消息。
+            quoted: 引用预览对象。
+            client: Native 客户端。
+
+        Returns:
+            tuple[List[bytes], Optional[bytes], str, str]: 图片、语音、PDF 文件名与正文。
+        """
+
+        empty: tuple[List[bytes], Optional[bytes], str, str] = ([], None, "", "")
+        thread = str(raw.get("threadId") or "")
+        server_id = str(quoted.get("serverId") or "")
+        if not thread or not server_id:
+            return empty
+        store = self._store
+        if store is None:
+            return empty
+        original_id = store.find_message_id(thread, server_id)
+        if original_id is None:
+            logger.info("引用消息的原消息不在记录范围内，无法读取媒体: server=%s", server_id)
+            return empty
+        try:
+            original = await client.message(original_id)
+        except (NativeAPIError, MediaError) as error:
+            logger.info("读取引用原消息失败: message=%s error=%s", original_id, error)
+            return empty
+        if (
+            original.get("id") != original_id
+            or original.get("threadId") != thread
+            or original.get("senderId") != quoted.get("senderId")
+            or original.get("serverId") != server_id
+            or original.get("recall") is not None
+        ):
+            logger.info("引用原消息身份不一致或已撤回，跳过媒体: message=%s", original_id)
+            return empty
+        return await self._load_media(native, original, client)
 
     async def _group_name(self, client: NativeClient, thread: str) -> str:
         """读取并缓存微信群名称。
@@ -775,6 +853,23 @@ class WeChatNativePlugin(MaiBotPlugin):
         pdf_text = ""
         if raw.get("type") not in {3, 34, 49} and not raw.get("media"):
             return images, voice, pdf_name, pdf_text
+        quoted = raw.get("quote")
+        if (
+            raw.get("type") == 49
+            and raw.get("appMessageType") == 57
+            and isinstance(quoted, dict)
+            and quoted.get("type") in {3, 34, 49}
+        ):
+            # 被引用的是一条媒体消息：引用预览里没有内容，必须回到原消息下载。
+            quoted_images, quoted_voice, quoted_name, quoted_text = await self._load_quoted_media(
+                native, raw, quoted, client
+            )
+            images.extend(quoted_images)
+            if quoted_voice is not None:
+                voice = quoted_voice
+            if quoted_name:
+                pdf_name = quoted_name
+                pdf_text = quoted_text
         try:
             body = await client.media_assets(str(raw["id"]))
         except (NativeAPIError, MediaError) as error:
@@ -805,8 +900,13 @@ class WeChatNativePlugin(MaiBotPlugin):
                     voice = data
                 elif kind == "file" and is_pdf_filename(filename):
                     data, _ = await client.media_content(asset_id, max_bytes=MAX_PDF_BYTES)
-                    pdf_text = await asyncio.to_thread(extract_pdf_text, data)
                     pdf_name = filename
+                    try:
+                        pdf_text = await asyncio.to_thread(extract_pdf_text, data)
+                    except (ValueError, MediaError) as error:
+                        # 提取失败也要让模型知道收到的是 PDF，而不是完全没有反应。
+                        logger.info("PDF 正文提取失败: message=%s error=%s", raw.get("id"), error)
+                        pdf_text = ""
             except (NativeAPIError, MediaError) as error:
                 logger.info("微信媒体读取失败: message=%s kind=%s error=%s", raw.get("id"), kind, error)
         return images, voice, pdf_name, pdf_text
@@ -1160,6 +1260,8 @@ class WeChatNativePlugin(MaiBotPlugin):
             client = self._client
             if not self._ready or native is None or client is None:
                 return {"success": False, "error": "微信网关尚未就绪，请等待 Native 账号上线"}
+            sent: List[str] = []
+            external_ids: List[str] = []
             try:
                 if message.get("platform") != PLATFORM:
                     raise ValueError("出站消息的平台与微信网关不一致")
@@ -1174,8 +1276,10 @@ class WeChatNativePlugin(MaiBotPlugin):
                 mentions, reply_id, quote = await self._apply_reply_style(
                     native, client, target, parts, source, mentions, reply_id
                 )
-                sent: List[str] = []
-                external_ids: List[str] = []
+                if mentions == ["all"] and not await self._can_mention_all(client, target):
+                    raise ValueError(
+                        "当前微信群不支持 @全体成员：机器人不是群主或管理员，或群设置已关闭该权限"
+                    )
                 for kind, content in parts:
                     key = secrets.token_hex(16)
                     if kind == "text":
@@ -1183,7 +1287,7 @@ class WeChatNativePlugin(MaiBotPlugin):
                             target,
                             content,
                             key,
-                            {"userIds": mentions} if mentions else None,
+                            _mentions_payload(mentions),
                             quote=quote,
                         )
                     elif kind == "image":
@@ -1217,8 +1321,40 @@ class WeChatNativePlugin(MaiBotPlugin):
                 self._mark_replied(message)
                 return {"success": True, "external_message_id": last, "metadata": {"send_keys": sent}}
             except (NativeAPIError, SendError, MediaError, ValueError) as error:
+                # 多段消息是逐条发送的：中途失败时前面的段落已经在微信里了，
+                # 必须如实说明，否则用户会以为整条消息没发出去。
                 logger.warning("微信出站失败: %s", error)
+                if sent:
+                    return {
+                        "success": False,
+                        "error": f"已发送 {len(sent)} 段后失败: {error}",
+                        "external_message_id": next(
+                            (value for value in reversed(external_ids) if value), ""
+                        ),
+                        "metadata": {"send_keys": sent},
+                    }
                 return {"success": False, "error": str(error)}
+
+    async def _can_mention_all(self, client: NativeClient, thread: str) -> bool:
+        """判断当前群是否允许 @全体成员。
+
+        微信只允许群主或管理员 @全体成员，Native 在无权时返回 403。
+        提前查群资料可以给出明确原因，而不是让用户看到裸的 HTTP 错误。
+
+        Args:
+            client: Native 客户端。
+            thread: 群会话 ID。
+
+        Returns:
+            bool: 允许时返回 ``True``。
+        """
+
+        try:
+            info = await client.group(thread)
+        except (NativeAPIError, MediaError) as error:
+            logger.info("读取群资料以判断 @全体成员 权限失败: thread=%s error=%s", thread, error)
+            return False
+        return info.get("canMentionAll") is True
 
     async def _lookup_message_id(self, client: NativeClient, key: str) -> str:
         """按幂等键回查已发送消息的真实 ID。
@@ -1355,6 +1491,43 @@ class WeChatNativePlugin(MaiBotPlugin):
         source_key = self._reply_source_key(message)
         if source_key:
             self._pending_source.pop(source_key, None)
+
+
+def _mentions_payload(mentions: List[str]) -> Optional[Dict[str, Any]]:
+    """把出站的 @ 列表翻译成 Native 的 mentions 结构。
+
+    Args:
+        mentions: 用户 ID 列表；``["all"]`` 表示 @全体成员。
+
+    Returns:
+        Optional[Dict[str, Any]]: Native mentions；没有 @ 时返回 ``None``。
+    """
+
+    if not mentions:
+        return None
+    if mentions == ["all"]:
+        return {"all": True}
+    return {"userIds": mentions}
+
+
+def _timestamp_acceptable(raw: Dict[str, Any]) -> bool:
+    """判断消息时间戳是否落在可回复窗口内。
+
+    参照原版 AstrBot 插件：允许 -60 秒到 +300 秒的偏差，
+    超出范围说明事件流积压或本机时钟异常。
+
+    Args:
+        raw: Native 消息对象。
+
+    Returns:
+        bool: 时间戳可接受时返回 ``True``。
+    """
+
+    stamp = parse_timestamp(raw)
+    if stamp is None:
+        return False
+    delta = time.time() - stamp
+    return -TIMESTAMP_TOLERANCE_BEHIND <= delta <= TIMESTAMP_TOLERANCE_AHEAD
 
 
 def _receipt_message_id(receipt: Any) -> str:

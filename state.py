@@ -177,7 +177,15 @@ class StateStore:
                 "WHERE sends.message_id=messages.id AND sends.state!='accepted' "
                 "AND send_chunks.state='accepted')"
             )
-            self.db.execute("UPDATE messages SET status='needs_review' WHERE status='queued'")
+            # 排队中的消息不因重启而作废：宿主可能还没轮到回复它们，
+            # 直接判成 needs_review 会让这些消息永远得不到回复。
+            # 但超过一天仍未回复的排队消息已经失去意义，标记为不再回复，
+            # 避免它们无限累积并干扰后续匹配。
+            self.db.execute(
+                "UPDATE messages SET status='no_reply' WHERE status='queued' AND id IN "
+                "(SELECT message_id FROM message_days WHERE day < ?)",
+                ((datetime.now().astimezone() - timedelta(days=1)).strftime("%Y-%m-%d"),),
+            )
             self.db.execute("UPDATE sends SET state='needs_review' WHERE state='submitting'")
             self.db.execute(
                 "UPDATE sticker_operations SET state='needs_review' WHERE state='submitting'"

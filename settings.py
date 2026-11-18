@@ -135,6 +135,13 @@ class ActionSection(PluginConfigBase):
         description="可执行写操作的 senderId 白名单",
         json_schema_extra={"hint": "填写真实 senderId（例如 wxid_xxx），不是昵称；留空时任何人都不能使用写操作工具"},
     )
+    recall_allowed_threads: List[str] = Field(
+        default_factory=list,
+        description="允许撤回消息的会话白名单",
+        json_schema_extra={
+            "hint": "填写群 ID 或 wxid；留空表示不限制。用于防止误撤回其他会话里的消息"
+        },
+    )
     enable_friend_requests: bool = Field(
         default=False,
         description="启用好友申请处理",

@@ -40,6 +40,7 @@ class NativeConfig:
     enable_wechat_actions: bool
     enable_friend_requests: bool
     wechat_action_admins: frozenset[str]
+    recall_allowed_threads: frozenset[str] = frozenset()
 
     @classmethod
     def from_settings(
@@ -112,6 +113,9 @@ class NativeConfig:
             enable_friend_requests=bool(action_settings.enable_friend_requests),
             wechat_action_admins=frozenset(
                 str(item).strip() for item in (action_settings.wechat_action_admins or []) if str(item).strip()
+            ),
+            recall_allowed_threads=frozenset(
+                str(item).strip() for item in (action_settings.recall_allowed_threads or []) if str(item).strip()
             ),
         )
 
