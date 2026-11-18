@@ -40,7 +40,8 @@
     "gateway.route_message",
     "gateway.update_state",
     "component.enable",
-    "component.disable"
+    "component.disable",
+    "message.get_by_id"
   ],
   "i18n": {
     "default_locale": "zh-CN",

@@ -10,7 +10,7 @@ import asyncio
 import secrets
 import unicodedata
 
-from .codec import is_group_thread
+from .codec import is_group_thread, split_message_id
 from .config import NativeConfig
 from .log import logger
 from .native_client import NativeAPIError, NativeClient
@@ -180,8 +180,12 @@ class WechatNativeTools:
         thread = str(thread or "").strip()
         target = str(message_id or "").strip()
         if target:
-            record = await client.message(target)
-            # 会话以消息自身的 threadId 为准，不依赖宿主是否传入会话 ID。
+            # 宿主既可能传本适配器合成的 ``账号:会话:原生ID``，也可能传原生 ID，
+            # 甚至可能传它自己的短 ID，三种都要能落到 Native 的消息上。
+            embedded_thread, raw_id = split_message_id(target)
+            thread = thread or embedded_thread
+            record = await self._find_message(client, target, raw_id, thread)
+            target = str(record.get("id") or "")
             resolved = str(record.get("threadId") or "").strip() or thread
             if not resolved:
                 raise ValueError("目标消息缺少会话信息，无法撤回")
@@ -261,6 +265,45 @@ class WechatNativeTools:
         remote = str(payload.get("remoteOutcome") or "unknown")
         raise ValueError(f"撤回结果未确认（remoteOutcome={remote}），请稍后在微信中确认")
 
+    async def _find_message(
+        self, client: NativeClient, given: str, raw_id: str, thread: str
+    ) -> Dict[str, Any]:
+        """把宿主给的消息 ID 落到一条真实的 Native 消息上。
+
+        宿主可能把外部消息 ID 换成自己的短 ID，此时无法直接按 ID 查询，
+        只能在当前会话里按 ID 后缀匹配。
+
+        Args:
+            client: Native 客户端。
+            given: 调用方传入的完整消息 ID。
+            raw_id: 从外部 ID 拆出的原生 ID；拆不出时等于 ``given``。
+            thread: 已知的会话 ID，可能为空。
+
+        Returns:
+            Dict[str, Any]: Native 消息记录。
+
+        Raises:
+            ValueError: 找不到对应消息。
+        """
+
+        candidates = [value for value in (raw_id, given) if value]
+        for candidate in candidates:
+            try:
+                record = await client.message(candidate)
+            except NativeAPIError:
+                continue
+            if isinstance(record, dict) and record.get("id"):
+                return record
+        if thread:
+            page = await client.messages(thread, limit=50)
+            items = page.get("items") if isinstance(page, dict) else None
+            for item in items or []:
+                if not isinstance(item, dict):
+                    continue
+                if given in str(item.get("id") or ""):
+                    return item
+        raise ValueError("找不到要撤回的微信消息，它可能已超出本地记录范围")
+
     async def _latest_own_message(
         self, client: NativeClient, native: NativeConfig, thread: str
     ) -> Dict[str, Any]:
@@ -278,7 +321,7 @@ class WechatNativeTools:
             ValueError: 没有可撤回的自发消息。
         """
 
-        page = await client.messages(thread, limit=20)
+        page = await client.messages(str(thread or "").strip(), limit=20)
         items = page.get("items") if isinstance(page, dict) else None
         for item in items or []:
             if not isinstance(item, dict) or item.get("deleted") is True:

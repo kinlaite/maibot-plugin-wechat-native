@@ -47,6 +47,31 @@ def message_id(account: str, thread: str, raw_id: str) -> str:
     return f"{account}:{thread}:{raw_id}"
 
 
+def split_message_id(value: str) -> Tuple[str, str]:
+    """把外部消息 ID 拆回 ``(thread, raw_id)``。
+
+    宿主可能把消息 ID 换成自己生成的短 ID，因此拆不出会话时返回空 thread，
+    由调用方改用消息自身反查。
+
+    Args:
+        value: 消息 ID，可能是本适配器合成的外部 ID，也可能是 Native 原始 ID。
+
+    Returns:
+        Tuple[str, str]: 会话 ID 与 Native 原始消息 ID，无法拆分时 thread 为空。
+    """
+
+    text = str(value or "").strip()
+    if not text:
+        return "", ""
+    head, sep, rest = text.partition(":")
+    if not sep:
+        return "", text
+    thread, sep, raw = rest.partition(":")
+    if not sep or not thread or not raw:
+        return "", text
+    return thread, raw
+
+
 def event_timestamp(raw: Dict[str, Any]) -> str:
     """把 Native 的时间戳转换为秒级字符串。
 

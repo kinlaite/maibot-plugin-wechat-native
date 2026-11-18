@@ -25,6 +25,7 @@ from .codec import (
     message_id,
     outbound,
     segments_from_media,
+    split_message_id,
 )
 from .config import MAX_PDF_BYTES, MAX_VOICE_BYTES, NativeConfig
 from .login import LoginSession, poll_login, start_login
@@ -779,8 +780,8 @@ class WeChatNativePlugin(MaiBotPlugin):
                 record = await self.ctx.message.get_by_id(
                     message_id, stream_id=stream_id, include_binary_data=False
                 )
-            except Exception as error:  # noqa: BLE001 - 查不到时退回上下文
-                logger.info("按消息 ID 反查微信会话失败，退回当前上下文: %s", error)
+            except Exception as error:  # noqa: BLE001 - 查不到时改用消息自身解析
+                logger.info("按消息 ID 反查微信会话失败，改用消息自身解析: %s", error)
             else:
                 info = record.get("message_info") if isinstance(record, dict) else None
                 if isinstance(info, dict):
@@ -796,6 +797,9 @@ class WeChatNativePlugin(MaiBotPlugin):
                         ).strip()
         if not thread:
             thread = str(kwargs.get("wechat_thread_id") or "").strip()
+        if not thread and message_id:
+            # 会话可以由消息 ID 自身还原，交给工具层处理。
+            thread = split_message_id(message_id)[0]
         return thread, message_id
 
     @Tool(
@@ -964,10 +968,11 @@ class WeChatNativePlugin(MaiBotPlugin):
                     native, client, target, parts, source, mentions, reply_id
                 )
                 sent: List[str] = []
+                external_ids: List[str] = []
                 for kind, content in parts:
                     key = secrets.token_hex(16)
                     if kind == "text":
-                        await client.send_text(
+                        receipt = await client.send_text(
                             target,
                             content,
                             key,
@@ -975,7 +980,7 @@ class WeChatNativePlugin(MaiBotPlugin):
                             quote=quote,
                         )
                     elif kind == "image":
-                        await client.send_image(
+                        receipt = await client.send_image(
                             target,
                             content,
                             _image_content_type(content),
@@ -984,7 +989,7 @@ class WeChatNativePlugin(MaiBotPlugin):
                             before_send=_noop_async,
                         )
                     else:
-                        await client.send_voice(
+                        receipt = await client.send_voice(
                             target,
                             content,
                             _voice_content_type(content),
@@ -994,7 +999,17 @@ class WeChatNativePlugin(MaiBotPlugin):
                             record_chunks=lambda _chunks: None,
                         )
                     sent.append(key)
-                last = sent[-1] if sent else ""
+                    # 宿主用这个 ID 回写自己的消息记录，撤回工具依赖它定位消息，
+                    # 因此必须是 Native 的真实消息 ID，不能是幂等键。
+                    external_ids.append(
+                        str(
+                            receipt.get("localMessageId")
+                            or receipt.get("messageId")
+                            or receipt.get("serverId")
+                            or ""
+                        )
+                    )
+                last = next((value for value in reversed(external_ids) if value), "")
                 self._mark_replied(message)
                 return {"success": True, "external_message_id": last, "metadata": {"send_keys": sent}}
             except (NativeAPIError, SendError, MediaError, ValueError) as error:
