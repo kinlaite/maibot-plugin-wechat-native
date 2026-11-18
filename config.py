@@ -31,7 +31,7 @@ class NativeConfig:
     enable_stickers: bool
     allowed_users: frozenset[str]
     allowed_groups: frozenset[str]
-    group_reply_mode: Literal["mention", "all", "disabled"]
+    group_reply_mode: Literal["enabled", "disabled"]
     group_reply_style: Literal["quote", "mention", "plain"]
     reconnect_delay_seconds: int
     max_image_bytes: int
@@ -81,9 +81,9 @@ class NativeConfig:
         account = str(settings.account_id or "").strip()
         if not account:
             raise ValueError("account_id 必填，取 GET /v1/accounts 返回的 id")
-        mode = str(network_settings.group_reply_mode or "mention").strip()
-        if mode not in {"mention", "all", "disabled"}:
-            raise ValueError("group_reply_mode 必须为 mention/all/disabled")
+        mode = str(network_settings.group_reply_mode or "enabled").strip()
+        if mode not in {"enabled", "disabled"}:
+            raise ValueError("group_reply_mode 必须为 enabled/disabled")
         style = str(network_settings.group_reply_style or "quote").strip()
         if style not in {"quote", "mention", "plain"}:
             raise ValueError("group_reply_style 必须为 quote/mention/plain")

@@ -73,11 +73,14 @@ class ChatSection(PluginConfigBase):
         description="群白名单",
         json_schema_extra={"hint": "使用 threadId（通常以 @chatroom 结尾）；留空允许所有群"},
     )
-    group_reply_mode: Literal["mention", "all", "disabled"] = Field(
-        default="mention",
-        description="群聊触发模式",
+    group_reply_mode: Literal["enabled", "disabled"] = Field(
+        default="enabled",
+        description="是否接入群聊消息",
         json_schema_extra={
-            "hint": "mention：仅明确 @机器人时接入；all：所有群消息都接入并交给麦麦主动回复策略；disabled：关闭群聊"
+            "hint": (
+                "enabled：所有群消息都接入，由麦麦按 @、昵称提及和回复概率决定是否回应；"
+                "disabled：不接入群聊。适配器不做 @ 过滤，否则麦麦完全看不到群聊"
+            )
         },
     )
     group_reply_style: Literal["quote", "mention", "plain"] = Field(

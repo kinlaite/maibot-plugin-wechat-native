@@ -817,10 +817,15 @@ class WeChatNativePlugin(MaiBotPlugin):
         for item in page.get("items") or []:
             if not isinstance(item, dict):
                 continue
+            # 群成员条目里的 username/id 才是微信 ID；displayName 是昵称，
+            # 拿昵称和机器人的 wxid 比较永远不相等，会把机器人自己也算进群名。
+            member_id = str(item.get("username") or item.get("id") or "").strip()
+            if member_id and member_id == self._self_id:
+                continue
             display = str(
                 item.get("roomDisplayName") or item.get("displayName") or ""
             ).strip()
-            if display and display != self._self_id:
+            if display:
                 names.append(display)
         if not names:
             return ""
@@ -845,7 +850,9 @@ class WeChatNativePlugin(MaiBotPlugin):
 
         if not user_id:
             return ""
-        cached = self._member_names.get(user_id)
+        # 同一个人在不同群的群昵称不同，缓存键必须带上群 ID，否则会串群。
+        cache_key = f"{thread}:{user_id}" if thread else user_id
+        cached = self._member_names.get(cache_key)
         now = asyncio.get_running_loop().time()
         if cached is not None and now - cached[1] < GROUP_NAME_TTL_SECONDS:
             return cached[0]
@@ -868,7 +875,7 @@ class WeChatNativePlugin(MaiBotPlugin):
         if not name:
             # 私聊和群昵称为空时都回退到联系人资料。
             name = await self._contact_name(client, user_id)
-        self._member_names[user_id] = (name, now)
+        self._member_names[cache_key] = (name, now)
         return name
 
     async def _contact_name(self, client: NativeClient, user_id: str) -> str:
@@ -1020,7 +1027,7 @@ class WeChatNativePlugin(MaiBotPlugin):
         """在工具调用中读取当前微信群资料。"""
 
         try:
-            stream = await self._tool_stream(kwargs)
+            stream = await self._tool_stream(kwargs, require_group=True)
             return await self._tools.get_group_info(stream["thread"])
         except Exception as error:
             return describe_error(error)
@@ -1042,7 +1049,7 @@ class WeChatNativePlugin(MaiBotPlugin):
         """在工具调用中列出或搜索当前群成员。"""
 
         try:
-            stream = await self._tool_stream(kwargs)
+            stream = await self._tool_stream(kwargs, require_group=True)
             return await self._tools.list_group_members(
                 stream["thread"], kwargs.get("limit", 50), kwargs.get("search", "")
             )
@@ -1120,7 +1127,10 @@ class WeChatNativePlugin(MaiBotPlugin):
             except Exception as error:  # noqa: BLE001 - 查不到时改用消息自身解析
                 logger.info("按消息 ID 反查微信会话失败，改用消息自身解析: %s", error)
             else:
-                info = record.get("message_info") if isinstance(record, dict) else None
+                # 宿主把消息包在 {"success": True, "message": {...}} 里，
+                # 直接读顶层 message_info 永远拿不到内容。
+                envelope = record.get("message") if isinstance(record, dict) else None
+                info = envelope.get("message_info") if isinstance(envelope, dict) else None
                 if isinstance(info, dict):
                     group_info = info.get("group_info")
                     if isinstance(group_info, dict) and group_info.get("group_id"):
@@ -1285,11 +1295,8 @@ class WeChatNativePlugin(MaiBotPlugin):
         stream_id = str(kwargs.get("stream_id") or kwargs.get("chat_id") or "").strip()
         if not stream_id:
             return ""
-        chat = getattr(self.ctx, "chat", None)
-        if chat is None:
-            return ""
         try:
-            streams = await chat.get_all_streams(platform=PLATFORM)
+            streams = await self.ctx.chat.get_all_streams(platform=PLATFORM)
         except Exception as error:  # noqa: BLE001 - 反查失败由调用方给出提示
             logger.info("按会话反查微信聊天流失败: %s", error)
             return ""
@@ -1355,6 +1362,10 @@ class WeChatNativePlugin(MaiBotPlugin):
                     raise ValueError(
                         "当前微信群不支持 @全体成员：机器人不是群主或管理员，或群设置已关闭该权限"
                     )
+                # 引用和 @ 只能挂在第一条文本上：多段回复逐条发送，
+                # 每段都带会让微信里出现多次引用和重复 @。
+                pending_quote = quote
+                pending_mentions = mentions
                 for kind, content in parts:
                     key = secrets.token_hex(16)
                     if kind == "text":
@@ -1362,9 +1373,11 @@ class WeChatNativePlugin(MaiBotPlugin):
                             target,
                             content,
                             key,
-                            _mentions_payload(mentions),
-                            quote=quote,
+                            _mentions_payload(pending_mentions),
+                            quote=pending_quote,
                         )
+                        pending_quote = None
+                        pending_mentions = []
                     elif kind == "image":
                         receipt = await client.send_image(
                             target,
