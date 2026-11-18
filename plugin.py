@@ -623,24 +623,8 @@ class WeChatNativePlugin(MaiBotPlugin):
                 return False
             if native.allowed_groups and thread not in native.allowed_groups:
                 return False
-            mentions = raw.get("mentions")
-            mentioned = (
-                isinstance(mentions, dict)
-                and mentions.get("state") == "known"
-                and mentions.get("self") is True
-            )
-            # 群聊里别人随手发的图片、文件与语音不是对机器人的请求，
-            # 只有被 @ 时才处理，否则会被无关内容触发回复。
-            raw_type = raw.get("type")
-            quote = raw.get("quote") if isinstance(raw.get("quote"), dict) else {}
-            direct_media = raw_type in {3, 34} or (
-                raw_type == 49 and raw.get("appMessageType") == 6
-            )
-            quoted_media = raw_type == 49 and raw.get("appMessageType") == 57 and bool(quote)
-            if (direct_media or quoted_media) and not mentioned:
-                return False
-            if native.group_reply_mode == "mention" and not mentioned:
-                return False
+            # 群消息全部交给宿主：宿主自己会按 @、昵称提及和回复概率决定要不要回。
+            # 适配器在入口处过滤会让麦麦完全看不到群聊，与 QQ 适配器的行为也不一致。
         elif not native.enable_private_reply:
             return False
         elif native.allowed_users and sender not in native.allowed_users:
@@ -709,6 +693,13 @@ class WeChatNativePlugin(MaiBotPlugin):
             message,
             external_message_id=external_id,
             dedupe_key=external_id,
+        )
+        logger.debug(
+            "微信入站路由: accepted=%s thread=%s is_at=%s sender=%s",
+            accepted,
+            thread,
+            message.get("is_at"),
+            sender,
         )
         if accepted:
             store.mark_message(external_id, "queued")
