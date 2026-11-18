@@ -2341,6 +2341,70 @@ class NativeClient:
                     "status_unavailable" if poll_failed else state, key, send_id
                 ) from None
 
+    async def events_probe(self, after: str) -> None:
+        """检查指定游标是否仍可订阅事件流。
+
+        Args:
+            after: 待检查的游标值。
+
+        Raises:
+            NativeAPIError: 游标已失效（410）或其他请求错误。
+        """
+
+        cursor_number(after)
+        if self.closed:
+            raise NativeAPIError(0)
+        timeout = aiohttp.ClientTimeout(total=8, sock_connect=self.request_timeout)
+        try:
+            async with self._session.get(
+                self.api_url + self.prefix + "/events/stream",
+                params={"after": after},
+                headers={"Accept": "text/event-stream", "Last-Event-ID": after},
+                allow_redirects=False,
+                timeout=timeout,
+            ) as response:
+                if response.status != 200:
+                    raise NativeAPIError(
+                        response.status, "event_cursor_expired" if response.status == 410 else ""
+                    )
+        except (aiohttp.ClientError, TimeoutError, OSError, asyncio.TimeoutError):
+            # 超时说明连接可用、事件流正常保持，只是没有更多事件可读。
+            return
+
+    async def latest_cursor(self) -> int | None:
+        """读取事件流中当前可见的最大游标。
+
+        只读取开头一小段就断开，用于判断本地游标是否越界。
+
+        Returns:
+            int | None: 最大游标；无法判断时返回 ``None``。
+        """
+
+        if self.closed:
+            raise NativeAPIError(0)
+        # 事件流不会自行结束，这里靠短超时截断，取截断前读到的最大游标。
+        timeout = aiohttp.ClientTimeout(total=8, sock_connect=self.request_timeout)
+        largest: int | None = None
+        try:
+            async with self._session.get(
+                self.api_url + self.prefix + "/events/stream",
+                params={"after": "0"},
+                headers={"Accept": "text/event-stream"},
+                allow_redirects=False,
+                timeout=timeout,
+            ) as response:
+                if response.status != 200:
+                    raise NativeAPIError(response.status)
+                async for raw in response.content:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if line.startswith("id: "):
+                        value = line[4:].strip()
+                        if value.isdigit():
+                            largest = max(largest or 0, int(value))
+        except (aiohttp.ClientError, TimeoutError, OSError, asyncio.TimeoutError):
+            return largest
+        return largest
+
     async def events(self, after: str) -> AsyncIterator[dict]:
         cursor_number(after)
         if self.closed:

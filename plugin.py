@@ -360,6 +360,8 @@ class WeChatNativePlugin(MaiBotPlugin):
                         await self._set_ready(False, "Native 账号尚未在线，等待微信登录")
                     else:
                         await self._set_ready(True, f"{self._self_id}（微信已在线）")
+                    await self._guard_cursor(client, store)
+                    await self._guard_cursor(client, store)
                     async for event in client.events(store.cursor):
                         await self._process_event(event, store)
                         delay = native.reconnect_delay_seconds
@@ -393,6 +395,22 @@ class WeChatNativePlugin(MaiBotPlugin):
                 with suppress(Exception):
                     await admin.close()
 
+    async def _guard_cursor(self, client: NativeClient, store: StateStore) -> None:
+        """确认保存的事件游标仍可订阅。
+
+        Native 的事件流是滚动窗口，游标失效时会返回 410。
+        这里只做一次探测，避免带着失效游标进入订阅后静默空转。
+
+        Args:
+            client: 已连接的 Native 客户端。
+            store: 状态存储。
+
+        Raises:
+            NativeAPIError: 游标已失效（410）时向上抛出，由外层决定停止接收。
+        """
+
+        await client.events_probe(store.cursor)
+
     async def _process_event(self, event: Dict[str, Any], store: StateStore) -> None:
         """处理单条 Native 事件并推进游标。
 
@@ -416,12 +434,12 @@ class WeChatNativePlugin(MaiBotPlugin):
             logger.error(
                 "WeChat Native 单条事件处理失败，已跳过: cursor=%s error=%s", cursor, error, exc_info=True
             )
-        if cursor:
-            cursor_number(cursor)
-            store.advance(str(cursor))
 
     async def _handle_event(self, event: Dict[str, Any], store: StateStore) -> None:
         """按事件类型分发消息、撤回与媒体更新。
+
+        参照上游实现：非消息事件直接推进游标；消息事件要求 origin 为 live
+        才算真正新收到，并用 accept 一次性完成去重与游标推进。
 
         Args:
             event: Native 推送的事件对象。
@@ -429,37 +447,61 @@ class WeChatNativePlugin(MaiBotPlugin):
         """
 
         kind = event.get("kind")
+        cursor = str(event.get("cursor") or "")
         data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        if not cursor or cursor_number(cursor) <= cursor_number(store.cursor):
+            return
         if kind == "message.recalled":
             store.recall(
                 str(data.get("threadId") or ""),
                 str(data.get("serverId") or "") or None,
                 str(data.get("messageId") or "") or None,
             )
+            store.advance(cursor)
             return
-        # Native 对已落库的消息统一发 message.committed，事件体只带 ID 与方向，
-        # 正文与发送者需要再按 messageId 取一次。
         if kind != "message.committed":
-            return
-        if data.get("direction") != "incoming":
+            store.advance(cursor)
             return
         message_id = str(data.get("messageId") or "").strip()
-        if not message_id:
+        thread = str(data.get("threadId") or "").strip()
+        if not message_id or not thread:
+            store.advance(cursor)
             return
         client = self._client
         if client is None:
             raise RuntimeError("WeChat Native 客户端未就绪")
         raw = await client.message(message_id)
-        if not isinstance(raw, dict) or not raw.get("threadId") or not raw.get("senderId"):
+        if (
+            raw.get("id") != message_id
+            or raw.get("accountId") != self._native.account_id
+            or raw.get("threadId") != thread
+        ):
+            raise ValueError("微信消息身份不一致")
+        # 只有 live 才是刚收到的消息；补同步的历史消息不应触发回复。
+        received = (
+            data.get("origin") == "live"
+            and raw.get("direction") == "incoming"
+            and raw.get("senderId") != self._self_id
+        )
+        if not received:
+            store.accept(cursor, message_id, thread, raw.get("serverId"), "ignored", received=False)
             return
-        await self._receive_message(raw, store)
+        accepted = await self._receive_message(raw, store, cursor=cursor)
+        if not accepted:
+            store.accept(cursor, message_id, thread, raw.get("serverId"), "ignored", received=False)
 
-    async def _receive_message(self, raw: Dict[str, Any], store: StateStore) -> None:
+    async def _receive_message(
+        self, raw: Dict[str, Any], store: StateStore, *, cursor: str = ""
+    ) -> bool:
         """把一条 Native 消息转换为麦麦消息并交给宿主路由。
 
         Args:
             raw: Native 消息对象。
             store: 状态存储。
+            cursor: 事件游标，传入时由本方法完成去重与推进。
+
+        Returns:
+            bool: 消息是否被交给宿主路由。
         """
 
         native = self._native
@@ -471,12 +513,12 @@ class WeChatNativePlugin(MaiBotPlugin):
         group = is_group_thread(thread)
         external_id = message_id(native.account_id, thread, str(raw["id"]))
         if store.message_status(external_id) is not None:
-            return
+            return False
         if group:
             if native.group_reply_mode == "disabled":
-                return
+                return False
             if native.allowed_groups and thread not in native.allowed_groups:
-                return
+                return False
             mentions = raw.get("mentions")
             mentioned = (
                 isinstance(mentions, dict)
@@ -484,13 +526,13 @@ class WeChatNativePlugin(MaiBotPlugin):
                 and mentions.get("self") is True
             )
             if native.group_reply_mode == "mention" and not mentioned:
-                return
+                return False
         elif not native.enable_private_reply:
-            return
+            return False
         elif native.allowed_users and sender not in native.allowed_users:
-            return
+            return False
         if sender == self._self_id:
-            return
+            return False
         body = raw["body"] if isinstance(raw.get("body"), str) else ""
         images: List[bytes] = []
         voice: Optional[bytes] = None
@@ -518,11 +560,18 @@ class WeChatNativePlugin(MaiBotPlugin):
             quote=quote,
         )
         try:
-            queue_message(self._store, native.account_id, raw, external_id)
+            if cursor:
+                accepted = store.accept(
+                    cursor, external_id, thread, raw.get("serverId"), "queued"
+                )
+                if not accepted:
+                    return False
+            else:
+                queue_message(self._store, native.account_id, raw, external_id)
         except StateIdentityError as error:
             # 同一条消息 ID 被复用于不同会话时，保留证据并要求人工检查，而不覆盖旧记录。
             logger.error("微信消息身份冲突，已保留原记录: %s (%s)", external_id, error)
-            return
+            return False
         self._pending_source[external_id] = {
             "threadId": thread,
             "senderId": sender,
@@ -535,9 +584,12 @@ class WeChatNativePlugin(MaiBotPlugin):
             external_message_id=external_id,
             dedupe_key=external_id,
         )
-        store.mark_message(external_id, "queued" if accepted else "no_reply")
-        if not accepted:
+        if accepted:
+            store.mark_message(external_id, "queued")
+        else:
+            store.mark_message(external_id, "no_reply")
             logger.info("麦麦过滤或去重了微信消息: %s", external_id)
+        return True
 
     async def _load_media(
         self, native: NativeConfig, raw: Dict[str, Any], client: NativeClient

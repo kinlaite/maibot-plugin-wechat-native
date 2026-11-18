@@ -517,6 +517,17 @@ class StateStore:
         with self.db:
             self._advance(cursor)
 
+    def advance_reset(self, cursor: str):
+        """强制把游标设为指定值，用于服务端事件日志重置后的回退。
+
+        Args:
+            cursor: 新的游标值。
+        """
+
+        cursor_number(cursor)
+        with self.db:
+            self.db.execute("UPDATE checkpoint SET cursor=? WHERE id=1", (cursor,))
+
     def accept(
         self,
         cursor: str,
