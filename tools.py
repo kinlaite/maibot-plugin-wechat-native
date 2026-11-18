@@ -15,6 +15,7 @@ from .config import NativeConfig
 from .log import logger
 from .native_client import NativeAPIError, NativeClient
 
+CONTACT_SEARCH_LIMIT = 100
 RECALL_ALLOWED_STATUSES = {"success", "already_recalled", "not_recallable", "needs_review"}
 
 
@@ -467,7 +468,9 @@ class WechatNativeTools:
         if not native.enable_contact_search:
             raise ToolUnavailable("联系人搜索未开启")
         keyword = clean_text(query, label="搜索关键词", maximum=128)
-        return await self._client().search_contact(keyword)
+        # Native 没有独立的搜索接口，用联系人列表的 query 参数过滤。
+        raw = await self._client().contacts(limit=CONTACT_SEARCH_LIMIT, query=keyword)
+        return _project_contacts(raw)
 
     async def list_contact_requests(self, search: str = "") -> Dict[str, Any]:
         """列出来自他人的好友申请。
@@ -508,6 +511,31 @@ class WechatNativeTools:
         operation = await admin.accept_contact_request(identifier, version, secrets.token_hex(16))
         await self._await_operation(admin, operation, label="接受好友申请")
         return {"success": True, "status": "accepted", "request_id": identifier}
+
+
+def _project_contacts(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """把联系人列表精简成模型需要的字段。
+
+    Args:
+        raw: Native 联系人响应。
+
+    Returns:
+        Dict[str, Any]: 精简后的联系人列表。
+    """
+
+    contacts: List[Dict[str, str]] = []
+    for item in raw.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        contacts.append(
+            {
+                "user_id": str(item.get("username") or item.get("id") or ""),
+                "display_name": str(item.get("displayName") or ""),
+                "remark": str(item.get("remark") or ""),
+                "alias": str(item.get("alias") or ""),
+            }
+        )
+    return {"contacts": contacts}
 
 
 def _project_group(raw: Dict[str, Any]) -> Dict[str, Any]:

@@ -47,6 +47,8 @@ from .tools import ToolUnavailable, WechatNativeTools, describe_error, tool_name
 GATEWAY_NAME = "wechat_native_gateway"
 MEDIA_RETRY_SECONDS = 3
 GROUP_NAME_TTL_SECONDS = 600.0
+COMPOSED_GROUP_NAME_LIMIT = 4
+CONTACT_LOOKUP_LIMIT = 200
 PENDING_SOURCE_LIMIT = 512
 CURSOR_PROBE_SECONDS = 4.0
 TIMESTAMP_TOLERANCE_BEHIND = 60.0
@@ -96,6 +98,7 @@ class WeChatNativePlugin(MaiBotPlugin):
         self._group_names: Dict[str, tuple[str, float]] = {}
         self._last_time_warning = 0.0
         self._member_names: Dict[str, tuple[str, float]] = {}
+        self._contact_names: Dict[str, tuple[str, float]] = {}
         self._admin_client: Optional[NativeClient] = None
         self._tools = WechatNativeTools(self)
         self._login = LoginSession()
@@ -770,12 +773,16 @@ class WeChatNativePlugin(MaiBotPlugin):
         Native 的消息对象不带群名，只能查群资料；每条消息都查会明显变慢，
         因此按会话缓存一段时间。
 
+        有些群的群名根本没有同步到 Native（``name`` 为空字符串，``displayName``
+        只是 chatroom ID）。这种情况下用群成员拼一个可辨识的名称，
+        否则界面上只能看到一串数字 ID。
+
         Args:
             client: Native 客户端。
             thread: 群会话 ID。
 
         Returns:
-            str: 群名称；读取失败时返回空字符串。
+            str: 群名称；完全无法确定时返回空字符串。
         """
 
         cached = self._group_names.get(thread)
@@ -787,16 +794,54 @@ class WeChatNativePlugin(MaiBotPlugin):
         except (NativeAPIError, MediaError) as error:
             logger.info("读取微信群资料失败: thread=%s error=%s", thread, error)
             return cached[0] if cached is not None else ""
-        name = str(info.get("name") or info.get("displayName") or "").strip()
+        name = str(info.get("name") or "").strip()
         if name and not is_group_thread(name):
             self._group_names[thread] = (name, now)
             return name
-        # 群名未同步时不要用 chatroom ID 冒充名称，让宿主自己回退。
-        self._group_names[thread] = ("", now)
-        return ""
+        # 群名没同步到 Native 时，用成员昵称拼一个可读名称。
+        fallback = await self._compose_group_name(client, thread)
+        self._group_names[thread] = (fallback, now)
+        return fallback
+
+    async def _compose_group_name(self, client: NativeClient, thread: str) -> str:
+        """用群成员昵称拼一个可辨识的群名。
+
+        小群直接列出成员，大群只给人数，避免名称过长。
+        Native 未同步群名时这是唯一能反映「这是哪个群」的信息。
+
+        Args:
+            client: Native 客户端。
+            thread: 群会话 ID。
+
+        Returns:
+            str: 拼出的群名；拿不到成员时返回空字符串。
+        """
+
+        try:
+            page = await client.group_members(thread, limit=20)
+        except (NativeAPIError, MediaError) as error:
+            logger.info("读取群成员以生成群名失败: thread=%s error=%s", thread, error)
+            return ""
+        names: List[str] = []
+        for item in page.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            display = str(
+                item.get("roomDisplayName") or item.get("displayName") or ""
+            ).strip()
+            if display and display != self._self_id:
+                names.append(display)
+        if not names:
+            return ""
+        if len(names) <= COMPOSED_GROUP_NAME_LIMIT:
+            return "、".join(names[:COMPOSED_GROUP_NAME_LIMIT])
+        return f"群聊（{len(names)}人）"
 
     async def _member_name(self, client: NativeClient, thread: str, user_id: str) -> str:
-        """按用户 ID 查群昵称或昵称。
+        """按用户 ID 查昵称。
+
+        群聊优先用群昵称，私聊用联系人资料；Native 的消息对象本身不带昵称，
+        不查的话界面上只能看到 wxid。
 
         Args:
             client: Native 客户端。
@@ -829,7 +874,46 @@ class WeChatNativePlugin(MaiBotPlugin):
                     item.get("roomDisplayName") or item.get("displayName") or ""
                 ).strip()
                 break
+        if not name:
+            # 私聊和群昵称为空时都回退到联系人资料。
+            name = await self._contact_name(client, user_id)
         self._member_names[user_id] = (name, now)
+        return name
+
+    async def _contact_name(self, client: NativeClient, user_id: str) -> str:
+        """从联系人资料里查昵称。
+
+        私聊消息不带 senderName，只能靠联系人接口补；
+        群成员没设群昵称时也用它兜底。
+
+        Args:
+            client: Native 客户端。
+            user_id: 微信用户 ID。
+
+        Returns:
+            str: 昵称；查不到时返回空字符串。
+        """
+
+        cached = self._contact_names.get(user_id)
+        now = asyncio.get_running_loop().time()
+        if cached is not None and now - cached[1] < GROUP_NAME_TTL_SECONDS:
+            return cached[0]
+        name = ""
+        try:
+            page = await client.contacts(limit=CONTACT_LOOKUP_LIMIT)
+        except (NativeAPIError, MediaError) as error:
+            logger.info("读取微信联系人失败: user=%s error=%s", user_id, error)
+            page = {}
+        for item in page.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("username") or item.get("id") or "") != user_id:
+                continue
+            name = str(
+                item.get("remark") or item.get("displayName") or item.get("nickname") or ""
+            ).strip()
+            break
+        self._contact_names[user_id] = (name, now)
         return name
 
     async def _load_media(

@@ -984,10 +984,30 @@ class NativeClient:
     async def search_contact(self, query: str):
         return await self._request("POST", self.prefix + "/search/contacts", json={"query": query})
 
-    async def contacts(self, *, limit, relation, search="", cursor=""):
-        params = {"limit": str(limit), "relation": relation}
+    async def contacts(self, *, limit, kind="", search="", query="", cursor=""):
+        """列出联系人。
+
+        服务端只接受 ``limit``、``cursor``、``query``、``search``、``kind``；
+        传其他参数会直接 400。``kind=group`` 在部分账号上返回空列表。
+
+        Args:
+            limit: 返回条数上限。
+            kind: 联系人类别，留空表示全部。
+            search: 昵称或备注关键词。
+            query: 与 ``search`` 同义的搜索词。
+            cursor: 分页游标。
+
+        Returns:
+            dict: 联系人列表与分页游标。
+        """
+
+        params = {"limit": str(limit)}
+        if kind:
+            params["kind"] = kind
         if search:
             params["search"] = search
+        if query:
+            params["query"] = query
         if cursor:
             params["cursor"] = cursor
         return await self._request("GET", self.prefix + "/contacts", params=params)
