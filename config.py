@@ -12,6 +12,10 @@ MAX_PDF_BYTES = 20 * 1024 * 1024
 MAX_PDF_PAGES = 50
 MAX_PDF_TEXT_CHARS = 32000
 MEDIA_DOWNLOAD_TIMEOUT = 60
+# 微信单条文本上限实测为 16 KiB：超过后 Native 直接判失败，不会截断。
+MAX_TEXT_BYTES = 16384
+# 游标过期后要把整个事件窗口读完才能确定真实上界，比普通探测更慢。
+WINDOW_DRAIN_SECONDS = 12.0
 DEFAULT_IMAGE_PROMPT = "请描述这张图片的内容。"
 DEFAULT_PDF_PROMPT = "请阅读并总结这份 PDF 文件的主要内容。"
 

@@ -146,18 +146,23 @@ class WechatNativeTools:
             raise ToolUnavailable("未配置 Native admin Token，写操作工具已关闭")
         return client
 
-    def check_admin(self, sender_id: str) -> None:
+    def check_admin(self, sender_id: str, *, scope: str = "actions") -> None:
         """确认发起者在管理员白名单内。
 
         Args:
             sender_id: 当前消息发送者的 platform 用户 ID。
+            scope: ``actions`` 表示写操作工具，``friends`` 表示好友申请工具；
+                两者由独立开关控制，不能共用一个开关判断。
 
         Raises:
-            ToolUnavailable: 未开启写操作或发起者不在白名单。
+            ToolUnavailable: 未开启对应能力或发起者不在白名单。
         """
 
         native = self._config
-        if not native.enable_wechat_actions:
+        if scope == "friends":
+            if not native.enable_friend_requests:
+                raise ToolUnavailable("好友申请工具未开启，请先在插件配置中启用")
+        elif not native.enable_wechat_actions:
             raise ToolUnavailable("写操作工具未开启，请先在插件配置中启用")
         if sender_id not in native.wechat_action_admins:
             raise ToolUnavailable("当前用户不在微信写操作管理员白名单内")
@@ -666,6 +671,8 @@ def tool_names(config: Optional[NativeConfig]) -> List[str]:
                 "wechat_rename_group",
             ]
         )
-    if config.enable_friend_requests:
+    if config.enable_friend_requests and config.wechat_action_admins:
+        # 好友申请工具同样要求管理员白名单：只开开关不放人会让工具
+        # 出现在列表里却必然被 check_admin 拒绝。
         names.extend(["wechat_list_friend_requests", "wechat_accept_friend_request"])
     return names

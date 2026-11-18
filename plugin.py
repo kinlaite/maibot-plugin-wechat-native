@@ -414,10 +414,16 @@ class WeChatNativePlugin(MaiBotPlugin):
                         logger.warning("WeChat Native 事件流已断开，使用已保存游标重连")
                 except NativeAPIError as error:
                     if error.status in {401, 403}:
+                        # Token 失效或权限不足属于配置问题，但 Native 重启期间
+                        # 也可能短暂返回 401；直接退出会让适配器永久停摆，
+                        # 这里退避重试并保持网关未就绪，让用户看到明确状态。
                         await self._set_ready(False, f"Native 拒绝连接（HTTP {error.status}）")
-                        logger.error("WeChat Native 停止接收: HTTP %s (%s)", error.status, error.code)
-                        raise
-                    if error.status == 410:
+                        logger.error(
+                            "WeChat Native 认证被拒绝: HTTP %s (%s)，将退避重试",
+                            error.status,
+                            error.code,
+                        )
+                    elif error.status == 410:
                         # 事件日志被服务端重置后旧游标永久失效，必须回到最新位置，
                         # 否则会一直卡在同一个 410 上再也收不到消息。
                         await self._reset_cursor(client, store)
@@ -483,6 +489,14 @@ class WeChatNativePlugin(MaiBotPlugin):
             # 服务端本身没有事件可读，不是游标问题。
             return
         current = store.cursor
+        # 优先跳到窗口末尾，避免把整个窗口的历史事件重放一遍。
+        # window_end_cursor 只读完当前可见的部分，可能仍落后于真实上界，
+        # 因此必须确认新游标能读到事件，否则退回窗口起点。
+        latest = await client.window_end_cursor()
+        if latest is not None and await self._cursor_has_events(client, str(latest)):
+            logger.warning("微信事件游标 %s 已读不到事件，重置到窗口末尾 %s", current, latest)
+            store.advance_reset(str(latest))
+            return
         logger.warning("微信事件游标 %s 已读不到事件，回到事件窗口起点", current)
         store.advance_reset("0")
 
@@ -512,19 +526,21 @@ class WeChatNativePlugin(MaiBotPlugin):
         """把失效的游标重置到服务端当前最新位置。
 
         Native 的事件日志被重置后旧游标永久失效，继续使用只会反复得到 410。
-        这里直接读取事件流当前可见的最大游标并写入状态库。
+        这里必须把整个窗口读完才能拿到真实上界：``latest_cursor`` 只读开头
+        一小段，用它重置会把游标倒退回窗口起点，导致大量历史事件被重放。
 
         Args:
             client: 已连接的 Native 客户端。
             store: 状态存储。
         """
 
-        latest = await client.latest_cursor()
-        if latest is None:
-            logger.warning("微信事件游标重置失败：无法读取服务端最新游标")
+        latest = await client.window_end_cursor()
+        if latest is not None and await self._cursor_has_events(client, str(latest)):
+            store.advance_reset(str(latest))
+            logger.warning("微信事件游标已重置到窗口末尾 %s", latest)
             return
-        store.advance_reset(str(latest))
-        logger.warning("微信事件游标已重置到 %s", latest)
+        store.advance_reset("0")
+        logger.warning("微信事件游标已重置到窗口起点")
 
     async def _process_event(self, event: Dict[str, Any], store: StateStore) -> None:
         """处理单条 Native 事件并推进游标。
@@ -546,9 +562,13 @@ class WeChatNativePlugin(MaiBotPlugin):
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            # 单条事件的数据问题不应该卡住整条事件流：
+            # 不推进游标就会在每次重连时重复处理同一条坏事件，形成无限循环。
             logger.error(
                 "WeChat Native 单条事件处理失败，已跳过: cursor=%s error=%s", cursor, error, exc_info=True
             )
+            if cursor:
+                store.advance(cursor)
 
     async def _handle_event(self, event: Dict[str, Any], store: StateStore) -> None:
         """按事件类型分发消息、撤回与媒体更新。
@@ -577,33 +597,38 @@ class WeChatNativePlugin(MaiBotPlugin):
         if kind != "message.committed":
             store.advance(cursor)
             return
-        message_id = str(data.get("messageId") or "").strip()
+        raw_message_id = str(data.get("messageId") or "").strip()
         thread = str(data.get("threadId") or "").strip()
-        if not message_id or not thread:
+        if not raw_message_id or not thread:
             store.advance(cursor)
             return
         client = self._client
         if client is None:
             raise RuntimeError("WeChat Native 客户端未就绪")
-        raw = await client.message(message_id)
+        # 只有 live 才是刚收到的消息。补同步的历史消息既不会触发回复，
+        # 也不需要请求详情：游标重置后重放几千条历史时，逐条请求详情会拖垮事件处理。
+        if data.get("origin") != "live":
+            # 状态库用的是 ``账号:会话:原生ID`` 复合 ID，事件里只有原生 ID。
+            external_id = message_id(self._native.account_id, thread, raw_message_id)
+            if store.message_status(external_id) is None:
+                store.accept(cursor, external_id, thread, None, "ignored", received=False)
+            else:
+                store.advance(cursor)
+            return
+        raw = await client.message(raw_message_id)
         if (
-            raw.get("id") != message_id
+            raw.get("id") != raw_message_id
             or raw.get("accountId") != self._native.account_id
             or raw.get("threadId") != thread
         ):
             raise ValueError("微信消息身份不一致")
-        # 只有 live 才是刚收到的消息；补同步的历史消息不应触发回复。
-        received = (
-            data.get("origin") == "live"
-            and raw.get("direction") == "incoming"
-            and raw.get("senderId") != self._self_id
-        )
+        received = raw.get("direction") == "incoming" and raw.get("senderId") != self._self_id
         if not received:
-            store.accept(cursor, message_id, thread, raw.get("serverId"), "ignored", received=False)
+            store.accept(cursor, raw_message_id, thread, raw.get("serverId"), "ignored", received=False)
             return
         accepted = await self._receive_message(raw, store, cursor=cursor)
         if not accepted:
-            store.accept(cursor, message_id, thread, raw.get("serverId"), "ignored", received=False)
+            store.accept(cursor, raw_message_id, thread, raw.get("serverId"), "ignored", received=False)
 
     async def _receive_message(
         self, raw: Dict[str, Any], store: StateStore, *, cursor: str = ""
@@ -1120,7 +1145,7 @@ class WeChatNativePlugin(MaiBotPlugin):
         """在工具调用中撤回机器人自己发送的消息。"""
 
         try:
-            self._tools.check_admin(str(kwargs.get("user_id") or ""))
+            self._tools.check_admin(str(kwargs.get("user_id") or ""), scope="actions")
             thread, message_id = await self._resolve_recall_target(kwargs)
             return await self._tools.recall_message(thread, message_id)
         except Exception as error:
@@ -1190,7 +1215,7 @@ class WeChatNativePlugin(MaiBotPlugin):
         """在工具调用中修改机器人的群昵称。"""
 
         try:
-            stream = await self._tool_stream(kwargs, require_group=True, admin=True)
+            stream = await self._tool_stream(kwargs, require_group=True, admin="actions")
             return await self._tools.set_my_group_nickname(stream["thread"], kwargs.get("nickname", ""))
         except Exception as error:
             return describe_error(error)
@@ -1211,7 +1236,7 @@ class WeChatNativePlugin(MaiBotPlugin):
         """在工具调用中修改当前群名称。"""
 
         try:
-            stream = await self._tool_stream(kwargs, require_group=True, admin=True)
+            stream = await self._tool_stream(kwargs, require_group=True, admin="actions")
             return await self._tools.rename_group(stream["thread"], kwargs.get("name", ""))
         except Exception as error:
             return describe_error(error)
@@ -1232,7 +1257,7 @@ class WeChatNativePlugin(MaiBotPlugin):
         """在工具调用中列出好友申请。"""
 
         try:
-            await self._tool_stream(kwargs, admin=True)
+            await self._tool_stream(kwargs, admin="friends")
             return await self._tools.list_contact_requests(kwargs.get("search", ""))
         except Exception as error:
             return describe_error(error)
@@ -1255,13 +1280,13 @@ class WeChatNativePlugin(MaiBotPlugin):
         """在工具调用中接受一条好友申请。"""
 
         try:
-            await self._tool_stream(kwargs, admin=True)
+            await self._tool_stream(kwargs, admin="friends")
             return await self._tools.accept_contact_request(kwargs.get("request_id", ""))
         except Exception as error:
             return describe_error(error)
 
     async def _tool_stream(
-        self, kwargs: Dict[str, Any], *, require_group: bool = False, admin: bool = False
+        self, kwargs: Dict[str, Any], *, require_group: bool = False, admin: str = ""
     ) -> Dict[str, str]:
         """解析当前工具调用所属的微信会话并校验权限。
 
@@ -1271,7 +1296,8 @@ class WeChatNativePlugin(MaiBotPlugin):
         Args:
             kwargs: 宿主传入的工具参数，含当前聊天上下文。
             require_group: 是否要求当前会话是群聊。
-            admin: 是否要求发起者在管理员白名单内。
+            admin: 非空时要求发起者在管理员白名单内；取值 ``actions`` 或
+                ``friends``，对应各自的开关。
 
         Returns:
             Dict[str, str]: 会话信息，至少包含 ``thread`` 与 ``sender``。
@@ -1298,7 +1324,7 @@ class WeChatNativePlugin(MaiBotPlugin):
         if require_group and not thread:
             raise ValueError("无法从当前会话确定微信群 ID")
         if admin:
-            self._tools.check_admin(sender)
+            self._tools.check_admin(sender, scope=admin)
         return {"thread": thread, "sender": sender}
 
     async def _thread_from_stream(self, kwargs: Dict[str, Any], sender: str) -> str:
@@ -1424,10 +1450,10 @@ class WeChatNativePlugin(MaiBotPlugin):
                     # 宿主用这个 ID 回写自己的消息记录，撤回工具依赖它定位消息，
                     # 因此必须是 Native 的真实消息 ID，不能是幂等键。
                     # 群 @ 消息的受理回执不带 localMessageId，需要按幂等键回查。
-                    message_id = _receipt_message_id(receipt)
-                    if not message_id:
-                        message_id = await self._lookup_message_id(client, key)
-                    external_ids.append(message_id)
+                    sent_message_id = _receipt_message_id(receipt)
+                    if not sent_message_id:
+                        sent_message_id = await self._lookup_message_id(client, key)
+                    external_ids.append(sent_message_id)
                 last = next((value for value in reversed(external_ids) if value), "")
                 self._mark_replied(message)
                 return {"success": True, "external_message_id": last, "metadata": {"send_keys": sent}}
@@ -1489,9 +1515,9 @@ class WeChatNativePlugin(MaiBotPlugin):
                 logger.info("按幂等键回查微信发送记录失败: %s", error)
                 return ""
             if isinstance(record, dict):
-                message_id = _receipt_message_id(record)
-                if message_id:
-                    return message_id
+                resolved = _receipt_message_id(record)
+                if resolved:
+                    return resolved
             if attempt < 2:
                 await asyncio.sleep(0.3)
         return ""

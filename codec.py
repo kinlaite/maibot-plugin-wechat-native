@@ -8,7 +8,7 @@ import time
 
 import msgpack
 
-from .config import MAX_VOICE_BYTES
+from .config import MAX_TEXT_BYTES, MAX_VOICE_BYTES
 
 PLATFORM = "wechat_native"
 MAX_GATEWAY_MESSAGE_BYTES = 16 * 1024 * 1024 - 64 * 1024
@@ -311,7 +311,9 @@ def outbound(
             if not isinstance(text, str):
                 raise ValueError("文本消息段格式无效")
             if text:
-                parts.append(("text", text))
+                # 微信单条文本上限 16 KiB，超出会整条发送失败；
+                # 这里按字节切成多段，避免长回复直接丢失。
+                parts.extend(("text", chunk) for chunk in _split_text(text))
         elif kind in {"image", "emoji"}:
             parts.append(("image", _segment_binary(segment, max_image_bytes, "图片")))
         elif kind == "voice":
@@ -339,6 +341,44 @@ def outbound(
     if parts and not any(part[0] == "text" for part in parts) and (mentions or reply_id):
         raise ValueError("Native 媒体接口不支持引用或 @，请在消息中添加文本承载这些信息")
     return target, parts, mentions, reply_id
+
+
+def _split_text(text: str, max_bytes: int = MAX_TEXT_BYTES) -> List[str]:
+    """把超长文本切成多条消息。
+
+    微信单条文本上限是 16 KiB，超过后 Native 直接判失败。
+    这里按 UTF-8 字节数切分，并保证不切断多字节字符；
+    优先在换行处断开，让分段读起来更自然。
+
+    Args:
+        text: 原始文本。
+        max_bytes: 单段字节上限。
+
+    Returns:
+        List[str]: 切分后的文本段；未超限时返回只含原文的列表。
+    """
+
+    if len(text.encode("utf-8")) <= max_bytes:
+        return [text]
+    chunks: List[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining.encode("utf-8")) <= max_bytes:
+            chunks.append(remaining)
+            break
+        # 按字节上限折算出最多能放多少字符，再从那里往回找换行。
+        cut = max_bytes
+        while cut > 0 and len(remaining[:cut].encode("utf-8")) > max_bytes:
+            cut -= 1
+        if cut <= 0:
+            cut = 1
+        window = remaining[:cut]
+        newline = window.rfind("\n")
+        if newline > cut // 2:
+            window = window[:newline]
+        chunks.append(window)
+        remaining = remaining[len(window):]
+    return [chunk for chunk in chunks if chunk]
 
 
 def segments_from_media(

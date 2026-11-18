@@ -25,10 +25,12 @@ from .config import (
     MAX_PDF_BYTES,
     MAX_PDF_PAGES,
     MAX_PDF_TEXT_CHARS,
+    MAX_TEXT_BYTES,
     MAX_VOICE_BYTES,
     MAX_VOICE_SECONDS,
     MEDIA_DOWNLOAD_TIMEOUT,
     VOICE_SEND_TIMEOUT,
+    WINDOW_DRAIN_SECONDS,
 )
 from .state import cursor_number
 
@@ -2298,11 +2300,15 @@ class NativeClient:
         *,
         quote: dict | None = None,
     ):
-        if not text.strip() or len(text.encode("utf-8")) > 65536:
-            raise ValueError("文本必须非空且不超过 64 KiB（含 @名称）")
+        # 微信侧单条文本上限是 16 KiB，与是否引用无关：
+        # 超过这个长度的消息 Native 会直接判失败，而不是截断。
+        if not text.strip():
+            raise ValueError("文本不能为空")
+        if len(text.encode("utf-8")) > MAX_TEXT_BYTES:
+            raise ValueError(
+                f"文本超过微信单条消息上限（{MAX_TEXT_BYTES // 1024} KiB），请拆分后再发送"
+            )
         if quote is not None:
-            if len(text.encode("utf-8")) > 16384:
-                raise ValueError("Native 引用回复文本不能超过 16 KiB")
             if (
                 not isinstance(quote, dict)
                 or set(quote) != {"messageId", "serverId"}
@@ -2404,6 +2410,40 @@ class NativeClient:
             raise NativeAPIError(0)
         # 事件流不会自行结束，这里靠短超时截断，取截断前读到的最大游标。
         timeout = aiohttp.ClientTimeout(total=8, sock_connect=self.request_timeout)
+        largest: int | None = None
+        try:
+            async with self._session.get(
+                self.api_url + self.prefix + "/events/stream",
+                params={"after": "0"},
+                headers={"Accept": "text/event-stream"},
+                allow_redirects=False,
+                timeout=timeout,
+            ) as response:
+                if response.status != 200:
+                    raise NativeAPIError(response.status)
+                async for raw in response.content:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if line.startswith("id: "):
+                        value = line[4:].strip()
+                        if value.isdigit():
+                            largest = max(largest or 0, int(value))
+        except (aiohttp.ClientError, TimeoutError, OSError, asyncio.TimeoutError):
+            return largest
+        return largest
+
+    async def window_end_cursor(self) -> int | None:
+        """把整个事件窗口读完，返回窗口内的最大游标。
+
+        ``latest_cursor`` 只读开头一小段，拿到的值远小于真实上界，
+        不能用于「游标太旧需要跳到最新位置」这类需要准确定位的场景。
+
+        Returns:
+            int | None: 窗口内最大游标；读不到任何事件时返回 ``None``。
+        """
+
+        if self.closed:
+            raise NativeAPIError(0)
+        timeout = aiohttp.ClientTimeout(total=WINDOW_DRAIN_SECONDS, sock_connect=self.request_timeout)
         largest: int | None = None
         try:
             async with self._session.get(
