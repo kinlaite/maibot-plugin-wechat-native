@@ -686,8 +686,9 @@ class WeChatNativePlugin(MaiBotPlugin):
         platforms=PLATFORM,
         visibility="visible",
         description=(
-            "仅用于微信：撤回机器人自己发送的一条消息。只能撤回机器人自己的消息，"
-            "不能撤回他人消息。不传 msg_id 时撤回本会话中机器人最近发送的一条。"
+            "仅用于微信：撤回机器人自己发送的一条消息。私聊和群聊都可以用，"
+            "但只能撤回机器人自己的消息，不能撤回他人消息。"
+            "不传 msg_id 时撤回本会话中机器人最近发送的一条。"
             "注意微信没有禁言或踢人能力。"
         ),
         parameters=[
@@ -698,7 +699,7 @@ class WeChatNativePlugin(MaiBotPlugin):
         """在工具调用中撤回机器人自己发送的消息。"""
 
         try:
-            stream = await self._tool_stream(kwargs, require_group=True, admin=True)
+            stream = await self._tool_stream(kwargs, admin=True)
             return await self._tools.recall_message(stream["thread"], kwargs.get("msg_id", ""))
         except Exception as error:
             return describe_error(error)

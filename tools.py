@@ -173,7 +173,9 @@ class WechatNativeTools:
         native = self._config
         client = self._client()
         admin = self._admin_client()
-        thread = require_thread(thread)
+        thread = str(thread or "").strip()
+        if not thread:
+            raise ValueError("当前会话缺少微信会话 ID，无法撤回")
         target = str(message_id or "").strip()
         if target:
             record = await client.message(target)
