@@ -10,7 +10,7 @@ import asyncio
 import secrets
 import unicodedata
 
-from .codec import is_group_thread, split_message_id
+from .codec import is_group_thread, split_message_id, strip_mentions
 from .config import NativeConfig
 from .log import logger
 from .native_client import NativeAPIError, NativeClient
@@ -415,7 +415,12 @@ class WechatNativeTools:
 
         thread = require_thread(thread)
         raw = await self._client().group(thread)
-        return _project_group(raw)
+        result = _project_group(raw)
+        if not result["name"]:
+            # Native 没同步群名时 displayName 就是 chatroom ID，
+            # 不能拿它冒充群名：改用与入站消息一致的成员拼名。
+            result["name"] = await self._plugin._group_name(self._client(), thread)
+        return result
 
     async def list_group_members(
         self, thread: str, limit: Any = 50, search: str = ""
@@ -454,10 +459,63 @@ class WechatNativeTools:
         normalized = str(thread or "").strip()
         if not normalized:
             raise ValueError("当前会话缺少微信会话 ID，无法读取历史消息")
-        raw = await self._client().messages(
+        client = self._client()
+        raw = await client.messages(
             normalized, limit=clamp_limit(limit, default=20, maximum=50), query=str(query or "").strip()
         )
-        return _project_messages(raw)
+        result = _project_messages(raw)
+        await self._fill_sender_names(client, normalized, result["messages"])
+        return result
+
+    async def _fill_sender_names(
+        self, client: NativeClient, thread: str, messages: List[Dict[str, Any]]
+    ) -> None:
+        """用群成员资料补齐历史消息缺失的发送者昵称。
+
+        Native 的历史接口常常不返回 ``senderName``，直接交给模型只剩 wxid。
+        群聊里可以用成员列表反查；私聊只有对方一人，直接取会话联系人资料。
+
+        Args:
+            client: Native 客户端。
+            thread: 会话 ID。
+            messages: 已投影的消息列表，就地补 ``sender_name``。
+        """
+
+        missing = {m["sender_id"] for m in messages if m.get("sender_id") and not m.get("sender_name")}
+        if not missing:
+            return
+        names: Dict[str, str] = {}
+        if is_group_thread(thread):
+            try:
+                page = await client.group_members(thread, limit=200)
+            except (NativeAPIError, ValueError) as error:
+                logger.info("补齐历史消息昵称失败: thread=%s error=%s", thread, error)
+                return
+            for item in page.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                member_id = str(item.get("username") or item.get("id") or "").strip()
+                if member_id in missing:
+                    name = str(item.get("roomDisplayName") or item.get("displayName") or "").strip()
+                    if name:
+                        names[member_id] = name
+        else:
+            try:
+                page = await client.contacts(limit=200)
+            except (NativeAPIError, ValueError) as error:
+                logger.info("补齐私聊昵称失败: thread=%s error=%s", thread, error)
+                return
+            for item in page.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                contact_id = str(item.get("username") or item.get("id") or "").strip()
+                if contact_id in missing:
+                    name = str(item.get("displayName") or item.get("remark") or "").strip()
+                    if name:
+                        names[contact_id] = name
+        for message in messages:
+            if not message.get("sender_name"):
+                message["sender_name"] = names.get(message.get("sender_id", ""), "")
 
     async def search_contact(self, query: str) -> Dict[str, Any]:
         """按关键词搜索微信联系人。
@@ -557,10 +615,13 @@ def _project_group(raw: Dict[str, Any]) -> Dict[str, Any]:
     """
 
     name = str(raw.get("name") or "").strip() or str(raw.get("remark") or "").strip()
-    display = str(raw.get("displayName") or "").strip()
+    # displayName 在群名未同步时就是 chatroom ID，不能当成群名返回，
+    # 否则模型会以为这个群就叫一串数字。真正的回退在调用方用成员拼名。
+    if is_group_thread(name):
+        name = ""
     return {
         "group_id": str(raw.get("id") or ""),
-        "name": name or display,
+        "name": name,
         "owner_id": str(raw.get("ownerId") or ""),
         "announcement": str(raw.get("announcement") or ""),
         "my_display_name": str(raw.get("myDisplayName") or ""),
@@ -582,18 +643,57 @@ def _project_members(raw: Dict[str, Any]) -> Dict[str, Any]:
     for item in raw.get("items") or []:
         if not isinstance(item, dict):
             continue
-        members.append(
-            {
-                "user_id": str(item.get("username") or item.get("id") or ""),
-                "display_name": str(item.get("displayName") or ""),
-                "group_nickname": str(item.get("roomDisplayName") or ""),
-            }
-        )
+        room_name = str(item.get("roomDisplayName") or "").strip()
+        display_name = str(item.get("displayName") or "").strip()
+        entry = {
+            "user_id": str(item.get("username") or item.get("id") or ""),
+            # 群内昵称才是群里看到的名字，没有时退回联系人昵称。
+            "display_name": room_name or display_name,
+        }
+        if room_name and display_name and room_name != display_name:
+            entry["contact_name"] = display_name
+        members.append(entry)
     result: Dict[str, Any] = {"members": members}
     next_cursor = str(raw.get("nextCursor") or "")
     if next_cursor:
         result["next_cursor"] = next_cursor
     return result
+
+
+MESSAGE_TYPE_NAMES = {
+    1: "text",
+    3: "image",
+    34: "voice",
+    42: "contact_card",
+    43: "video",
+    47: "sticker",
+    48: "location",
+    49: "app",
+    10000: "system",
+}
+
+
+def message_type_name(value: Any) -> str:
+    """把微信消息类型码翻译成可读名称。
+
+    Native 历史接口返回的是微信内部数字类型码（``1`` 文本、``49`` 应用消息），
+    直接交给模型只会得到一串无意义的数字。
+
+    Args:
+        value: Native 消息的 ``type`` 字段。
+
+    Returns:
+        str: 可读类型名；未知类型返回 ``"unknown"``。
+    """
+
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or "unknown"
+    if isinstance(value, bool):
+        return "unknown"
+    if isinstance(value, int):
+        return MESSAGE_TYPE_NAMES.get(value, f"type_{value}")
+    return "unknown"
 
 
 def _project_messages(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -610,15 +710,17 @@ def _project_messages(raw: Dict[str, Any]) -> Dict[str, Any]:
     for item in raw.get("items") or []:
         if not isinstance(item, dict) or item.get("deleted") is True:
             continue
+        body = strip_mentions(str(item.get("body") or "")).strip()
         messages.append(
             {
                 "message_id": str(item.get("id") or ""),
                 "sender_id": str(item.get("senderId") or ""),
+                # 历史消息常常没有 senderName，群里看到的是昵称而不是 wxid。
+                "sender_name": str(item.get("senderName") or ""),
                 "direction": str(item.get("direction") or ""),
                 "timestamp": str(item.get("createdAt") or ""),
-                "type": item.get("type"),
-                "text": str(item.get("body") or ""),
-            }
+                "type": message_type_name(item.get("type")),
+                "text": body,            }
         )
     result: Dict[str, Any] = {"messages": messages}
     next_cursor = str(raw.get("nextCursor") or "")

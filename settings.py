@@ -160,7 +160,7 @@ class MediaSection(PluginConfigBase):
     __ui_order__ = 3
 
     enable_media: bool = Field(default=True, description="启用图片、PDF 与语音识别")
-    enabled_stickers: bool = Field(default=False, description="启用表情读取与发送")
+    enabled_stickers: bool = Field(default=False, description="启用表情读取（微信无表情包发送接口）")
     max_image_mb: int = Field(default=10, ge=1, le=20, description="单张图片大小上限（MB）")
 
 

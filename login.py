@@ -98,7 +98,9 @@ async def _apply_operation(session: LoginSession, operation: Dict[str, Any], cli
             image = await client.login_qr(session.operation_id, generation)
             session.generation = generation
             session.qr_image = "data:image/png;base64," + base64.b64encode(image).decode("ascii")
-        session.expires_at = time.time() + QR_TTL_SECONDS
+            # 过期时间只跟二维码本身走：每次轮询都重设会让前端永远认为它有效，
+            # 而微信侧其实已经换了码。
+            session.expires_at = time.time() + QR_TTL_SECONDS
         session.message = "请用微信扫描二维码，并在手机上确认登录"
         session.tone = "neutral"
         return

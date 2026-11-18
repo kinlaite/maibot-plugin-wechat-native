@@ -50,7 +50,6 @@ GROUP_NAME_TTL_SECONDS = 600.0
 COMPOSED_GROUP_NAME_LIMIT = 4
 CONTACT_LOOKUP_LIMIT = 200
 PENDING_SOURCE_LIMIT = 512
-CURSOR_PROBE_SECONDS = 4.0
 TIMESTAMP_TOLERANCE_BEHIND = 900.0
 TIMESTAMP_TOLERANCE_AHEAD = 300.0
 TIME_WARNING_INTERVAL = 60.0
@@ -377,7 +376,9 @@ class WeChatNativePlugin(MaiBotPlugin):
         )
         self._ready = ready and accepted
         if ready and not accepted:
-            raise RuntimeError("麦麦未接受 WeChat Native 网关路由")
+            # 宿主拒绝路由时只记录状态，不能抛错：这里由接收循环调用，
+            # 抛出的异常会让整个事件流永久退出，反而更收不到消息。
+            logger.error("麦麦未接受 WeChat Native 网关路由，入站消息可能被拒绝")
 
     async def _run(self) -> None:
         """保持事件流连接，断线后按退避间隔重连。"""
@@ -401,6 +402,7 @@ class WeChatNativePlugin(MaiBotPlugin):
                     if account.get("id") != native.account_id:
                         raise ValueError("account_identity_mismatch")
                     self._self_id = str(account.get("ownUsername") or native.account_id)
+                    await self._bind_server_identity(client, store)
                     if not account.get("authenticated") or account.get("connection") != "online":
                         await self._set_ready(False, "Native 账号尚未在线，等待微信登录")
                     else:
@@ -433,8 +435,9 @@ class WeChatNativePlugin(MaiBotPlugin):
                         await self._set_ready(False, f"Native 暂时不可达（HTTP {error.status}），等待重连")
                         logger.warning("WeChat Native 暂时不可达，将重连（HTTP %s）", error.status)
                 except ValueError as error:
-                    await self._set_ready(False, "消息身份校验失败，保留游标等待重试")
-                    logger.error("WeChat Native 收到无效消息身份: %s", error)
+                    # 单条消息的身份校验失败不应该把整个网关标记为未就绪：
+                    # 宿主看到 ready=False 会拒收该网关之后的所有入站消息。
+                    logger.error("WeChat Native 收到无效消息身份，已跳过: %s", error)
                 if not self._stopping:
                     await asyncio.sleep(delay)
                     delay = min(30, delay * 2)
@@ -452,6 +455,35 @@ class WeChatNativePlugin(MaiBotPlugin):
             if admin is not None and not admin.closed:
                 with suppress(Exception):
                     await admin.close()
+
+    async def _bind_server_identity(self, client: NativeClient, store: StateStore) -> None:
+        """把状态库绑定到当前 Native 服务端身份。
+
+        状态库里保存的游标、去重记录和发送记录都只对同一个 Native 实例有效。
+        服务端被重装或换机后 ``serverId`` 会变，继续沿用旧记录会把新实例的
+        历史消息当成已处理而全部丢弃，因此这里做一次身份绑定。
+
+        Args:
+            client: 已连接的 Native 客户端。
+            store: 状态存储。
+        """
+
+        try:
+            status = await client.status()
+        except (NativeAPIError, ValueError) as error:
+            logger.info("读取 Native 服务端身份失败，跳过状态库绑定: %s", error)
+            return
+        server_id = str(status.get("serverId") or "").strip()
+        if not server_id:
+            return
+        try:
+            store.bind_server(server_id)
+        except StateIdentityError as error:
+            # 服务端身份变了：旧游标对新实例没有意义，重置后继续收消息，
+            # 同时保留旧数据供排查，而不是直接丢弃。
+            logger.warning("Native 服务端身份已变化，重置事件游标: %s", error)
+            store.advance_reset("0")
+            store.rebind_server(server_id)
 
     async def _guard_cursor(self, client: NativeClient, store: StateStore) -> None:
         """确认保存的事件游标仍可订阅。
@@ -483,51 +515,28 @@ class WeChatNativePlugin(MaiBotPlugin):
             store: 状态存储。
         """
 
-        if await self._cursor_has_events(client, store.cursor):
+        if await client.cursor_has_events(store.cursor):
             return
-        if not await self._cursor_has_events(client, "0"):
+        if not await client.cursor_has_events("0"):
             # 服务端本身没有事件可读，不是游标问题。
             return
         current = store.cursor
-        # 优先跳到窗口末尾，避免把整个窗口的历史事件重放一遍。
-        # window_end_cursor 只读完当前可见的部分，可能仍落后于真实上界，
-        # 因此必须确认新游标能读到事件，否则退回窗口起点。
+        # 游标失效时跳到窗口末尾，避免把整个窗口的历史事件重放一遍。
+        # 末尾位置用二分探测得到，且必须确认它真的能读到事件。
         latest = await client.window_end_cursor()
-        if latest is not None and await self._cursor_has_events(client, str(latest)):
+        if latest is not None and await client.cursor_has_events(str(latest)):
             logger.warning("微信事件游标 %s 已读不到事件，重置到窗口末尾 %s", current, latest)
             store.advance_reset(str(latest))
             return
         logger.warning("微信事件游标 %s 已读不到事件，回到事件窗口起点", current)
         store.advance_reset("0")
 
-    async def _cursor_has_events(self, client: NativeClient, cursor: str) -> bool:
-        """判断从指定游标能否读到至少一条事件。
-
-        Args:
-            client: 已连接的 Native 客户端。
-            cursor: 起始游标。
-
-        Returns:
-            bool: 读到事件返回 ``True``。
-        """
-
-        stream = client.events(cursor)
-        try:
-            async with asyncio.timeout(CURSOR_PROBE_SECONDS):
-                async for _ in stream:
-                    return True
-        except (TimeoutError, NativeAPIError, asyncio.CancelledError):
-            return False
-        finally:
-            await stream.aclose()
-        return False
-
     async def _reset_cursor(self, client: NativeClient, store: StateStore) -> None:
         """把失效的游标重置到服务端当前最新位置。
 
         Native 的事件日志被重置后旧游标永久失效，继续使用只会反复得到 410。
-        这里必须把整个窗口读完才能拿到真实上界：``latest_cursor`` 只读开头
-        一小段，用它重置会把游标倒退回窗口起点，导致大量历史事件被重放。
+        窗口末尾由二分探测得到：``latest_cursor`` 只读开头一小段，
+        直接用它重置会让游标倒退，触发大量历史事件重放。
 
         Args:
             client: 已连接的 Native 客户端。
@@ -535,7 +544,7 @@ class WeChatNativePlugin(MaiBotPlugin):
         """
 
         latest = await client.window_end_cursor()
-        if latest is not None and await self._cursor_has_events(client, str(latest)):
+        if latest is not None and await client.cursor_has_events(str(latest)):
             store.advance_reset(str(latest))
             logger.warning("微信事件游标已重置到窗口末尾 %s", latest)
             return
@@ -1175,10 +1184,9 @@ class WeChatNativePlugin(MaiBotPlugin):
             except Exception as error:  # noqa: BLE001 - 查不到时改用消息自身解析
                 logger.info("按消息 ID 反查微信会话失败，改用消息自身解析: %s", error)
             else:
-                # 宿主把消息包在 {"success": True, "message": {...}} 里，
-                # 直接读顶层 message_info 永远拿不到内容。
-                envelope = record.get("message") if isinstance(record, dict) else None
-                info = envelope.get("message_info") if isinstance(envelope, dict) else None
+                # SDK 已按 message 键解包，这里拿到的是消息字典本身。
+                # 再读一次 record["message"] 只会得到 None，反查必然失败。
+                info = record.get("message_info") if isinstance(record, dict) else None
                 if isinstance(info, dict):
                     group_info = info.get("group_info")
                     if isinstance(group_info, dict) and group_info.get("group_id"):

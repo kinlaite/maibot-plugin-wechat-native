@@ -12,6 +12,9 @@ MAX_PDF_BYTES = 20 * 1024 * 1024
 MAX_PDF_PAGES = 50
 MAX_PDF_TEXT_CHARS = 32000
 MEDIA_DOWNLOAD_TIMEOUT = 60
+# 探测单个游标能否读到事件的最长等待：事件流空闲时不会返回数据，只能靠超时截断。
+# 越界游标会立即给空流，超时只需覆盖网络往返，不必等很久。
+CURSOR_PROBE_SECONDS = 1.2
 # 微信单条文本上限实测为 16 KiB：超过后 Native 直接判失败，不会截断。
 MAX_TEXT_BYTES = 16384
 # 游标过期后要把整个事件窗口读完才能确定真实上界，比普通探测更慢。

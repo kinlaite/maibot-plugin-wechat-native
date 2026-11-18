@@ -29,8 +29,8 @@ from .config import (
     MAX_VOICE_BYTES,
     MAX_VOICE_SECONDS,
     MEDIA_DOWNLOAD_TIMEOUT,
+    CURSOR_PROBE_SECONDS,
     VOICE_SEND_TIMEOUT,
-    WINDOW_DRAIN_SECONDS,
 )
 from .state import cursor_number
 
@@ -2397,25 +2397,31 @@ class NativeClient:
             # 超时说明连接可用、事件流正常保持，只是没有更多事件可读。
             return
 
-    async def latest_cursor(self) -> int | None:
-        """读取事件流中当前可见的最大游标。
+    async def latest_cursor(self, after: str = "0", *, sample: int = 200) -> int | None:
+        """读取事件流中某个位置之后能看到的游标，用于估算窗口量级。
 
-        只读取开头一小段就断开，用于判断本地游标是否越界。
+        只读取开头一小段就断开：事件流不会自行结束，读完整窗口要几十秒。
+        因此这里读够 ``sample`` 条就返回，得到的值只用于估算，不代表真实上界。
+
+        Args:
+            after: 起始游标。
+            sample: 读到多少条事件后提前返回。
 
         Returns:
-            int | None: 最大游标；无法判断时返回 ``None``。
+            int | None: 读到的最大游标；无法判断时返回 ``None``。
         """
 
+        cursor_number(after)
         if self.closed:
             raise NativeAPIError(0)
-        # 事件流不会自行结束，这里靠短超时截断，取截断前读到的最大游标。
         timeout = aiohttp.ClientTimeout(total=8, sock_connect=self.request_timeout)
         largest: int | None = None
+        count = 0
         try:
             async with self._session.get(
                 self.api_url + self.prefix + "/events/stream",
-                params={"after": "0"},
-                headers={"Accept": "text/event-stream"},
+                params={"after": after},
+                headers={"Accept": "text/event-stream", "Last-Event-ID": after},
                 allow_redirects=False,
                 timeout=timeout,
             ) as response:
@@ -2427,43 +2433,65 @@ class NativeClient:
                         value = line[4:].strip()
                         if value.isdigit():
                             largest = max(largest or 0, int(value))
+                            count += 1
+                            if count >= sample:
+                                return largest
         except (aiohttp.ClientError, TimeoutError, OSError, asyncio.TimeoutError):
             return largest
         return largest
 
     async def window_end_cursor(self) -> int | None:
-        """把整个事件窗口读完，返回窗口内的最大游标。
+        """找出事件窗口的真实上界。
 
-        ``latest_cursor`` 只读开头一小段，拿到的值远小于真实上界，
-        不能用于「游标太旧需要跳到最新位置」这类需要准确定位的场景。
+        事件流按顺序推送，从 ``after=0`` 读完整窗口要三十秒以上，
+        远慢于一次重连的容忍时间。这里改用二分探测：Native 对越界游标
+        返回空流而不是 410，因此可以直接用「该位置能否读到事件」收缩区间。
 
         Returns:
-            int | None: 窗口内最大游标；读不到任何事件时返回 ``None``。
+            int | None: 窗口内可读的最大游标；无法确定时返回 ``None``。
         """
 
         if self.closed:
             raise NativeAPIError(0)
-        timeout = aiohttp.ClientTimeout(total=WINDOW_DRAIN_SECONDS, sock_connect=self.request_timeout)
-        largest: int | None = None
+        # 先确认窗口起点有事件，否则整个事件日志是空的。
+        if not await self.cursor_has_events("0"):
+            return None
+        # 从窗口起点连读一段，拿到窗口内的一个可读位置作为二分下界。
+        # 这一步比逐点探测便宜：事件是连续推送的，读 200 条只需几十毫秒。
+        probe = await self.latest_cursor("0", sample=200) or 0
+        low = max(probe, 1)
+        high = low * 2
+        while high < 1_000_000 and await self.cursor_has_events(str(high)):
+            low = high
+            high *= 2
+        while low + 1 < high:
+            mid = (low + high) // 2
+            if await self.cursor_has_events(str(mid)):
+                low = mid
+            else:
+                high = mid
+        return low
+
+    async def cursor_has_events(self, after: str) -> bool:
+        """判断从指定游标能否读到至少一条事件。
+
+        越界游标不会返回 410，而是给一条空流；空流不会自行结束，
+        只能靠超时截断，所以这里的超时必须短，否则一次游标自愈要几十秒。
+
+        Args:
+            after: 起始游标。
+
+        Returns:
+            bool: 读到事件返回 ``True``。
+        """
+
         try:
-            async with self._session.get(
-                self.api_url + self.prefix + "/events/stream",
-                params={"after": "0"},
-                headers={"Accept": "text/event-stream"},
-                allow_redirects=False,
-                timeout=timeout,
-            ) as response:
-                if response.status != 200:
-                    raise NativeAPIError(response.status)
-                async for raw in response.content:
-                    line = raw.decode("utf-8", "replace").strip()
-                    if line.startswith("id: "):
-                        value = line[4:].strip()
-                        if value.isdigit():
-                            largest = max(largest or 0, int(value))
-        except (aiohttp.ClientError, TimeoutError, OSError, asyncio.TimeoutError):
-            return largest
-        return largest
+            async with asyncio.timeout(CURSOR_PROBE_SECONDS):
+                async for _ in self.events(after):
+                    return True
+        except (TimeoutError, NativeAPIError):
+            return False
+        return False
 
     async def events(self, after: str) -> AsyncIterator[dict]:
         cursor_number(after)

@@ -123,6 +123,22 @@ def strip_leading_mentions(text: str) -> str:
     return re.sub(rf"^(?:@[^{MENTION_SUFFIX}\r\n]+{MENTION_SUFFIX}[ \t]*)+", "", text)
 
 
+def strip_mentions(text: str) -> str:
+    """去掉正文中所有微信 @ 标记。
+
+    微信把 ``@昵称`` 后面跟着一个不可见的 ``\\u2005`` 当作提及标记，
+    它在句中出现时 ``strip_leading_mentions`` 不会处理。
+
+    Args:
+        text: 原始消息正文。
+
+    Returns:
+        str: 去掉所有 @ 标记后的正文。
+    """
+
+    return re.sub(rf"@[^{MENTION_SUFFIX}\r\n]+{MENTION_SUFFIX}", "", text)
+
+
 def pdf_context_text(name: str, text: str) -> str:
     """把 PDF 提取文字包装为参考资料。
 
