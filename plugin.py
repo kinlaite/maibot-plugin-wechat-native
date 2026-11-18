@@ -51,7 +51,7 @@ COMPOSED_GROUP_NAME_LIMIT = 4
 CONTACT_LOOKUP_LIMIT = 200
 PENDING_SOURCE_LIMIT = 512
 CURSOR_PROBE_SECONDS = 4.0
-TIMESTAMP_TOLERANCE_BEHIND = 60.0
+TIMESTAMP_TOLERANCE_BEHIND = 900.0
 TIMESTAMP_TOLERANCE_AHEAD = 300.0
 TIME_WARNING_INTERVAL = 60.0
 ALL_TOOL_NAMES = (
@@ -1597,8 +1597,9 @@ def _mentions_payload(mentions: List[str]) -> Optional[Dict[str, Any]]:
 def _timestamp_acceptable(raw: Dict[str, Any]) -> bool:
     """判断消息时间戳是否落在可回复窗口内。
 
-    参照原版 AstrBot 插件：允许 -60 秒到 +300 秒的偏差，
-    超出范围说明事件流积压或本机时钟异常。
+    Native 的事件流会补发历史消息，这些消息不能触发回复；
+    但正常消息也可能因为网络或服务端延迟而晚到几十秒到几分钟。
+    因此允许 15 分钟内的旧消息，并容忍 5 分钟内的时钟偏差。
 
     Args:
         raw: Native 消息对象。
@@ -1611,7 +1612,9 @@ def _timestamp_acceptable(raw: Dict[str, Any]) -> bool:
     if stamp is None:
         return False
     delta = time.time() - stamp
-    return -TIMESTAMP_TOLERANCE_BEHIND <= delta <= TIMESTAMP_TOLERANCE_AHEAD
+    # delta 为正表示消息比本机时间旧：允许旧 BEHIND 秒内的消息；
+    # delta 为负表示消息时间在未来：只容忍 AHEAD 秒的时钟偏差。
+    return -TIMESTAMP_TOLERANCE_AHEAD <= delta <= TIMESTAMP_TOLERANCE_BEHIND
 
 
 def _receipt_message_id(receipt: Any) -> str:

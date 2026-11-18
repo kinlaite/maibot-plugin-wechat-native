@@ -224,7 +224,13 @@ def inbound(
         "timestamp": event_timestamp(raw),
         "message_info": info,
         "raw_message": raw_segments,
+        # 宿主靠这些顶层标志位判断群消息是否在 @ 机器人；
+        # 缺失时 is_at 恒为 False，群聊消息会被当成「没叫我」而丢弃。
+        "is_at": bool(mentioned),
+        "is_mentioned": bool(mentioned),
         "is_picture": any(segment["type"] == "image" for segment in segments),
+        "is_emoji": bool(raw.get("isEmoji")) or any(segment["type"] == "emoji" for segment in segments),
+        "is_command": body.startswith("/"),
     }
     if len(msgpack.packb(message, use_bin_type=True)) > MAX_GATEWAY_MESSAGE_BYTES:
         raise ValueError("消息超过麦麦网关的 16 MB 帧限制")
