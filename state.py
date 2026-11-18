@@ -1,0 +1,685 @@
+"""Small transactional journal: IDs/receipts only, never tokens or message bodies.
+
+The AstrBot queue cannot participate in a database transaction. A crash after
+handoff is therefore retained for review rather than automatically handed off twice.
+"""
+
+import hashlib
+import sqlite3
+import time
+from contextlib import closing
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+def state_path(root: Path, api_url: str, account_id: str, bot_id: str) -> Path:
+    identity = f"{api_url}\n{account_id}\n{bot_id}"
+    return Path(root) / (hashlib.sha256(identity.encode()).hexdigest() + ".sqlite3")
+
+
+def read_statistics(path: Path) -> dict:
+    """Read a snapshot without running journal migration or crash recovery."""
+    unavailable = {"available": False, "days": [], "today": None, "pending_review": None}
+    try:
+        if not path.exists():
+            return unavailable
+        with closing(
+            sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
+        ) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("BEGIN")
+            tables = {
+                row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            if not {"settings", "messages", "message_days"}.issubset(tables):
+                return unavailable
+            since = db.execute("SELECT value FROM settings WHERE key='statistics_since'").fetchone()
+            if since is None:
+                return unavailable
+            now = datetime.now().astimezone()
+            dates = [(now.date() - timedelta(days=i)).isoformat() for i in reversed(range(7))]
+            rows = db.execute(
+                "SELECT d.day, COUNT(*) AS received, SUM(m.status='replied') AS replied, "
+                "SUM(m.status='failed') AS failed, SUM(m.status='partial') AS partial "
+                "FROM message_days d JOIN messages m ON m.id=d.message_id "
+                "WHERE d.day BETWEEN ? AND ? GROUP BY d.day",
+                (dates[0], dates[-1]),
+            ).fetchall()
+            counts = {row["day"]: dict(row) for row in rows}
+            days = []
+            for day in dates:
+                empty = None if day < since[0][:10] else 0
+                row = counts.get(day, {})
+                days.append(
+                    {
+                        "date": day,
+                        **{
+                            key: row.get(key, empty)
+                            for key in ("received", "replied", "failed", "partial")
+                        },
+                    }
+                )
+            pending = db.execute(
+                "SELECT COUNT(*) FROM messages WHERE status IN ('needs_review','partial')"
+            ).fetchone()[0]
+            return {
+                "available": True,
+                "days": days,
+                "today": days[-1],
+                "pending_review": pending,
+                "since": since[0],
+                "timezone": now.tzname(),
+            }
+    except (sqlite3.Error, OSError, ValueError):
+        return {**unavailable, "reason": "无法读取统计，请检查机器人状态库是否可用"}
+
+
+def cursor_number(value: str) -> int:
+    if (
+        not isinstance(value, str)
+        or not value.isascii()
+        or not value.isdecimal()
+        or len(value) > 19
+        or int(value) > 9223372036854775807
+    ):
+        raise ValueError("invalid_cursor")
+    return int(value)
+
+
+def clean_sticker_caption(value: str | None) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = "".join(" " if ord(c) < 32 or ord(c) == 127 else c for c in value)
+    return " ".join(cleaned.split())[:160]
+
+
+class StateIdentityError(RuntimeError):
+    """Stored identity changed; preserve evidence and require operator inspection."""
+
+
+class StateStore:
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(path)
+        path.chmod(0o600)
+        self.db.row_factory = sqlite3.Row
+        self.db.executescript("""
+            PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=FULL;
+            CREATE TABLE IF NOT EXISTS checkpoint (id INTEGER PRIMARY KEY, cursor TEXT NOT NULL);
+            INSERT OR IGNORE INTO checkpoint VALUES (1, '0');
+            CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS cooldowns (
+                account TEXT NOT NULL, thread TEXT NOT NULL, until REAL NOT NULL,
+                PRIMARY KEY(account, thread));
+            CREATE TABLE IF NOT EXISTS action_intents (
+                account TEXT NOT NULL, thread TEXT NOT NULL, trigger TEXT NOT NULL,
+                action TEXT NOT NULL, key TEXT NOT NULL UNIQUE, param_hash TEXT NOT NULL,
+                target TEXT NOT NULL, server_id TEXT, own_sender TEXT NOT NULL,
+                operation_id TEXT, status TEXT NOT NULL, created REAL NOT NULL,
+                PRIMARY KEY(account, thread, trigger));
+            CREATE TABLE IF NOT EXISTS recalls (
+                thread TEXT NOT NULL, server_id TEXT NOT NULL, PRIMARY KEY(thread, server_id));
+            CREATE TABLE IF NOT EXISTS friend_operations (
+                action TEXT NOT NULL, target_hash TEXT NOT NULL, revision_hash TEXT NOT NULL,
+                key TEXT NOT NULL UNIQUE, status TEXT NOT NULL, operation_id TEXT,
+                PRIMARY KEY(action, target_hash));
+            CREATE TABLE IF NOT EXISTS friend_notifications (
+                request_hash TEXT PRIMARY KEY, status TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY, thread TEXT NOT NULL, server_id TEXT, status TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS message_days (
+                message_id TEXT PRIMARY KEY, day TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS message_days_day ON message_days(day);
+            CREATE TABLE IF NOT EXISTS sends (
+                key TEXT PRIMARY KEY, message_id TEXT, thread TEXT NOT NULL,
+                state TEXT NOT NULL, send_id TEXT);
+            CREATE INDEX IF NOT EXISTS sends_message_state ON sends(message_id, state);
+            CREATE TABLE IF NOT EXISTS send_chunks (
+                key TEXT NOT NULL, part INTEGER NOT NULL, state TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL, server_id TEXT,
+                PRIMARY KEY(key, part));
+            CREATE TABLE IF NOT EXISTS sticker_operations (
+                account TEXT NOT NULL, thread TEXT NOT NULL, trigger_message_id TEXT NOT NULL,
+                action TEXT NOT NULL, content_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE, source_hash TEXT NOT NULL,
+                job_id TEXT, state TEXT NOT NULL, created_at REAL NOT NULL,
+                updated_at REAL NOT NULL, server_message_id TEXT,
+                UNIQUE(account, thread, trigger_message_id, action));
+            CREATE UNIQUE INDEX IF NOT EXISTS sticker_save_inflight
+                ON sticker_operations(account, content_id)
+                WHERE action='save' AND state IN ('pending','submitting','needs_review');
+            CREATE UNIQUE INDEX IF NOT EXISTS sticker_acquire_inflight
+                ON sticker_operations(account, action, content_id)
+                WHERE action LIKE 'acquire:%'
+                    AND state IN ('pending','submitting','needs_review');
+            CREATE UNIQUE INDEX IF NOT EXISTS sticker_library_inflight
+                ON sticker_operations(account, action, content_id)
+                WHERE action LIKE 'library:%'
+                    AND state IN ('pending','submitting','needs_review');
+            CREATE TABLE IF NOT EXISTS sticker_labels (
+                account TEXT NOT NULL,
+                content_id TEXT NOT NULL,
+                caption TEXT NOT NULL DEFAULT '',
+                ready_gif INTEGER NOT NULL DEFAULT 0,
+                content_type TEXT NOT NULL DEFAULT '',
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(account, content_id));
+        """)
+        with self.db:
+            self.db.execute(
+                "INSERT OR IGNORE INTO settings VALUES ('statistics_since', ?)",
+                (datetime.now().astimezone().isoformat(),),
+            )
+            self.db.execute(
+                "UPDATE messages SET status='partial' WHERE status IN ('queued','needs_review') "
+                "AND EXISTS (SELECT 1 FROM sends JOIN send_chunks USING(key) "
+                "WHERE sends.message_id=messages.id AND sends.state!='accepted' "
+                "AND send_chunks.state='accepted')"
+            )
+            self.db.execute("UPDATE messages SET status='needs_review' WHERE status='queued'")
+            self.db.execute("UPDATE sends SET state='needs_review' WHERE state='submitting'")
+            self.db.execute(
+                "UPDATE sticker_operations SET state='needs_review' WHERE state='submitting'"
+            )
+            self.db.execute(
+                "UPDATE messages SET status=CASE WHEN status='replied' THEN 'partial' "
+                "ELSE 'needs_review' END WHERE status IN ('replied','no_reply') "
+                "AND EXISTS (SELECT 1 FROM sends WHERE sends.message_id=messages.id "
+                "AND sends.state!='accepted')"
+            )
+
+    def friend_operation(self, action, target_hash):
+        return self.db.execute(
+            "SELECT * FROM friend_operations WHERE action=? AND target_hash=?",
+            (action, target_hash),
+        ).fetchone()
+
+    def start_friend_operation(self, action, target_hash, revision_hash, key, previous_key):
+        with self.db:
+            return (
+                self.db.execute(
+                    "INSERT INTO friend_operations VALUES (?, ?, ?, ?, 'submitting', NULL) "
+                    "ON CONFLICT(action, target_hash) DO UPDATE SET "
+                    "revision_hash=excluded.revision_hash, key=excluded.key, "
+                    "status='submitting', operation_id=NULL WHERE friend_operations.key=?",
+                    (action, target_hash, revision_hash, key, previous_key),
+                ).rowcount
+                == 1
+            )
+
+    def finish_friend_operation(self, key, status, operation_id=None):
+        with self.db:
+            self.db.execute(
+                "UPDATE friend_operations SET status=?, operation_id=COALESCE(?, operation_id) "
+                "WHERE key=?",
+                (status, operation_id, key),
+            )
+
+    def save_friend_baseline(self, request_hashes):
+        with self.db:
+            self.db.executemany(
+                "INSERT OR IGNORE INTO friend_notifications VALUES (?, 'baseline')",
+                ((request_hash,) for request_hash in request_hashes),
+            )
+
+    def has_friend_notification(self, request_hash):
+        return (
+            self.db.execute(
+                "SELECT 1 FROM friend_notifications WHERE request_hash=?", (request_hash,)
+            ).fetchone()
+            is not None
+        )
+
+    def claim_friend_notification(self, request_hash):
+        with self.db:
+            return (
+                self.db.execute(
+                    "INSERT OR IGNORE INTO friend_notifications VALUES (?, 'attempted')",
+                    (request_hash,),
+                ).rowcount
+                == 1
+            )
+
+    def finish_friend_notification(self, request_hash, status):
+        with self.db:
+            self.db.execute(
+                "UPDATE friend_notifications SET status=? WHERE request_hash=?",
+                (status, request_hash),
+            )
+
+    def cooldown(self, account: str, thread: str) -> float:
+        row = self.db.execute(
+            "SELECT until FROM cooldowns WHERE account=? AND thread=?", (account, thread)
+        ).fetchone()
+        return row[0] if row else 0.0
+
+    def is_recalled(self, thread, server_id):
+        return (
+            self.db.execute(
+                "SELECT 1 FROM recalls WHERE thread=? AND server_id=?", (thread, server_id)
+            ).fetchone()
+            is not None
+        )
+
+    def sticker_operation(self, account, thread, trigger, action):
+        row = self.db.execute(
+            "SELECT * FROM sticker_operations WHERE account=? AND thread=? "
+            "AND trigger_message_id=? AND action=?",
+            (account, thread, trigger, action),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def claim_sticker(self, account, thread, trigger, action, content_id, key, source_hash, now):
+        if not content_id:
+            raise ValueError("sticker_content_identity_required")
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            existing = self.sticker_operation(account, thread, trigger, action)
+            if not existing and (action == "save" or action.startswith(("acquire:", "library:"))):
+                row = self.db.execute(
+                    "SELECT * FROM sticker_operations WHERE account=? AND content_id=? "
+                    "AND action IN (?,?) AND state IN ('pending','submitting','needs_review')",
+                    (
+                        account,
+                        content_id,
+                        action,
+                        "library:download" if action.startswith("library:download:") else action,
+                    ),
+                ).fetchone()
+                if row:
+                    existing = dict(row)
+            if existing:
+                # Pack acquisition without a Native job ID never received an admission
+                # receipt; reclaim the same idempotency key instead of deadlocking forever.
+                if (
+                    action.startswith("acquire:")
+                    and existing["state"] == "needs_review"
+                    and not existing["job_id"]
+                ):
+                    self.db.execute(
+                        "UPDATE sticker_operations SET state='submitting', updated_at=? "
+                        "WHERE idempotency_key=? AND state='needs_review' AND job_id IS NULL",
+                        (now, existing["idempotency_key"]),
+                    )
+                    reclaimed = self.db.execute(
+                        "SELECT * FROM sticker_operations WHERE idempotency_key=?",
+                        (existing["idempotency_key"],),
+                    ).fetchone()
+                    return dict(reclaimed), True
+                return existing, False
+            if action == "send" and thread.endswith("@chatroom"):
+                if self.db.execute(
+                    "SELECT 1 FROM sticker_operations WHERE account=? AND thread=? "
+                    "AND action='send' AND created_at>? LIMIT 1",
+                    (account, thread, now - 30),
+                ).fetchone():
+                    return None, False
+            self.db.execute(
+                "INSERT INTO sticker_operations VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, NULL, 'submitting', ?, ?, NULL)",
+                (account, thread, trigger, action, content_id, key, source_hash, now, now),
+            )
+            return self.sticker_operation(account, thread, trigger, action), True
+
+    def finish_sticker(self, key, state, job_id=None, server_message_id=None):
+        with self.db:
+            self.db.execute(
+                "UPDATE sticker_operations SET state=?, job_id=COALESCE(?,job_id), "
+                "server_message_id=COALESCE(?,server_message_id), "
+                "updated_at=CAST(strftime('%s','now') AS REAL) WHERE idempotency_key=? "
+                "AND state NOT IN ('success','already_saved','failed')",
+                (state, job_id, server_message_id, key),
+            )
+
+    def pending_stickers(self, account):
+        return [
+            dict(r)
+            for r in self.db.execute(
+                "SELECT * FROM sticker_operations WHERE account=? "
+                "AND state IN ('pending','submitting','needs_review') ORDER BY created_at",
+                (account,),
+            )
+        ]
+
+    def sticker_operation_by_job(self, account, job_id):
+        row = self.db.execute(
+            "SELECT * FROM sticker_operations WHERE account=? AND job_id=? LIMIT 1",
+            (account, job_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def complete_sticker_send(self, key, job_id, server_id):
+        """Commit the accepted receipt, outbox and source status atomically."""
+        with self.db:
+            self.db.execute(
+                "UPDATE sticker_operations SET state='success', job_id=?, server_message_id=?, "
+                "updated_at=CAST(strftime('%s','now') AS REAL) WHERE idempotency_key=?",
+                (job_id, server_id, key),
+            )
+            self.db.execute(
+                "UPDATE sends SET state='accepted', send_id=? WHERE key=?", (job_id, key)
+            )
+            self.db.execute(
+                "UPDATE messages SET status='replied' WHERE (id,thread) IN "
+                "(SELECT trigger_message_id,thread FROM sticker_operations "
+                "WHERE idempotency_key=?) "
+                "AND status!='recalled' AND NOT EXISTS "
+                "(SELECT 1 FROM sends WHERE message_id=messages.id AND state!='accepted')",
+                (key,),
+            )
+
+    def sticker_label(self, account: str, content_id: str) -> dict | None:
+        row = self.db.execute(
+            "SELECT * FROM sticker_labels WHERE account=? AND content_id=?",
+            (account, content_id.lower()),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def sticker_labels(self, account: str) -> dict[str, dict]:
+        rows = self.db.execute(
+            "SELECT * FROM sticker_labels WHERE account=?", (account,)
+        ).fetchall()
+        return {row["content_id"]: dict(row) for row in rows}
+
+    def upsert_sticker_label(
+        self,
+        account: str,
+        content_id: str,
+        *,
+        caption: str | None = None,
+        ready_gif: bool | None = None,
+        content_type: str | None = None,
+    ):
+        cleaned = clean_sticker_caption(caption) if caption is not None else ""
+        now = time.time()
+        with self.db:
+            existing = self.sticker_label(account, content_id)
+            next_caption = cleaned if cleaned else (existing["caption"] if existing else "")
+            next_ready = (
+                (1 if ready_gif else 0)
+                if ready_gif is not None
+                else (existing["ready_gif"] if existing else 0)
+            )
+            next_type = (
+                content_type[:64]
+                if content_type is not None
+                else (existing["content_type"] if existing else "")
+            )
+            self.db.execute(
+                "INSERT INTO sticker_labels "
+                "(account, content_id, caption, ready_gif, content_type, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(account, content_id) DO UPDATE SET "
+                "caption=excluded.caption, ready_gif=excluded.ready_gif, "
+                "content_type=excluded.content_type, updated_at=excluded.updated_at",
+                (account, content_id.lower(), next_caption, next_ready, next_type, now),
+            )
+
+    def action_intent(self, account, thread, trigger):
+        row = self.db.execute(
+            "SELECT * FROM action_intents WHERE account=? AND thread=? AND trigger=?",
+            (account, thread, trigger),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def claim_action(
+        self,
+        account,
+        thread,
+        trigger,
+        action,
+        key,
+        param_hash,
+        target,
+        server_id,
+        own_sender,
+        created,
+    ):
+        with self.db:
+            inserted = self.db.execute(
+                "INSERT OR IGNORE INTO action_intents VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'needs_review', ?)",
+                (
+                    account,
+                    thread,
+                    trigger,
+                    action,
+                    key,
+                    param_hash,
+                    target,
+                    server_id,
+                    own_sender,
+                    created,
+                ),
+            ).rowcount
+        return bool(inserted)
+
+    def finish_action(self, key, status, operation_id=None):
+        with self.db:
+            self.db.execute(
+                "UPDATE action_intents SET status=?, "
+                "operation_id=COALESCE(?, operation_id) WHERE key=?",
+                (status, operation_id, key),
+            )
+
+    def recent_action(self, account, thread, action):
+        row = self.db.execute(
+            "SELECT * FROM action_intents WHERE account=? AND thread=? AND action=? "
+            "ORDER BY created DESC LIMIT 1",
+            (account, thread, action),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def pending_actions(self, account):
+        return [
+            dict(row)
+            for row in self.db.execute(
+                "SELECT * FROM action_intents WHERE account=? "
+                "AND status IN ('pending','needs_review') ORDER BY created LIMIT 100",
+                (account,),
+            )
+        ]
+
+    def recall_target_matches(self, account, message_id, thread, server_id):
+        row = self.db.execute(
+            "SELECT thread, server_id FROM action_intents WHERE account=? "
+            "AND action='recall_own_message' AND target=? LIMIT 1",
+            (account, message_id),
+        ).fetchone()
+        return row is None or (row[0] == thread and row[1] == server_id)
+
+    def set_cooldown(self, account: str, thread: str, until: float):
+        with self.db:
+            self.db.execute("DELETE FROM cooldowns WHERE until<=?", (until - 600,))
+            self.db.execute(
+                "INSERT OR REPLACE INTO cooldowns VALUES (?, ?, ?)", (account, thread, until)
+            )
+
+    def bind_server(self, server_id: str):
+        if not isinstance(server_id, str) or not server_id:
+            raise StateIdentityError("Native server identity unavailable; state retained")
+        row = self.db.execute("SELECT value FROM settings WHERE key='server_id'").fetchone()
+        if row and row[0] != server_id:
+            raise StateIdentityError("Native server identity changed; state retained for review")
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO settings VALUES ('server_id', ?)", (server_id,))
+
+    @property
+    def cursor(self) -> str:
+        return self.db.execute("SELECT cursor FROM checkpoint WHERE id=1").fetchone()[0]
+
+    def _advance(self, cursor: str):
+        if cursor_number(cursor) > cursor_number(self.cursor):
+            self.db.execute("UPDATE checkpoint SET cursor=? WHERE id=1", (cursor,))
+
+    def advance(self, cursor: str):
+        with self.db:
+            self._advance(cursor)
+
+    def accept(
+        self,
+        cursor: str,
+        message_id: str,
+        thread: str,
+        server_id: str | None,
+        status: str,
+        *,
+        received: bool = True,
+    ) -> bool:
+        existing = self.db.execute(
+            "SELECT thread, server_id FROM messages WHERE id=?", (message_id,)
+        ).fetchone()
+        if existing and (existing[0] != thread or existing[1] != server_id):
+            self.mark_message(message_id, "needs_review")
+            raise StateIdentityError("Native message identity reused; cursor retained for review")
+        with self.db:
+            recalled = self.db.execute(
+                "SELECT 1 FROM recalls WHERE thread=? AND server_id=?", (thread, server_id)
+            ).fetchone()
+            result = self.db.execute(
+                "INSERT OR IGNORE INTO messages VALUES (?, ?, ?, ?)",
+                (message_id, thread, server_id, "recalled" if recalled else status),
+            )
+            if result.rowcount == 1 and received:
+                self.db.execute(
+                    "INSERT INTO message_days VALUES (?, ?)",
+                    (message_id, datetime.now().astimezone().date().isoformat()),
+                )
+            self._advance(cursor)
+            return result.rowcount == 1 and not recalled
+
+    def message_status(self, message_id: str) -> str | None:
+        row = self.db.execute("SELECT status FROM messages WHERE id=?", (message_id,)).fetchone()
+        return row[0] if row else None
+
+    def message_matches(self, message_id: str, thread: str, server_id: str | None) -> bool:
+        row = self.db.execute(
+            "SELECT thread, server_id FROM messages WHERE id=?", (message_id,)
+        ).fetchone()
+        return bool(row and row[0] == thread and row[1] == server_id)
+
+    def find_message_id(self, thread: str, server_id: str) -> str | None:
+        rows = self.db.execute(
+            "SELECT id FROM messages WHERE thread=? AND server_id=? LIMIT 2", (thread, server_id)
+        ).fetchall()
+        return rows[0][0] if len(rows) == 1 else None
+
+    def latest_pending_message(self, account: str, thread: str) -> str | None:
+        """返回指定会话中最近一条等待回复的入站消息。
+
+        Args:
+            account: Native 账号 ID。
+            thread: 会话 ID，群聊为 ``@chatroom`` 结尾的 threadId。
+
+        Returns:
+            str | None: 待回复消息 ID；没有匹配时返回 ``None``。
+        """
+
+        prefix = f"{account}:{thread}:"
+        row = self.db.execute(
+            "SELECT id FROM messages WHERE status='queued' AND id LIKE ? ORDER BY rowid DESC LIMIT 1",
+            (prefix + "%",),
+        ).fetchone()
+        return row[0] if row else None
+
+    def mark_message(self, message_id: str, status: str):
+        with self.db:
+            self.db.execute(
+                "UPDATE messages SET status=CASE "
+                "WHEN status='partial' THEN 'partial' "
+                "WHEN status='replied' AND ? IN ('failed','needs_review') THEN 'partial' "
+                "WHEN status IN ('failed','needs_review') AND ?='replied' THEN 'partial' "
+                "ELSE ? END WHERE id=? AND status!='recalled'",
+                (status, status, status, message_id),
+            )
+
+    def recall(self, thread: str, server_id: str | None, message_id: str | None):
+        with self.db:
+            if server_id:
+                self.db.execute("INSERT OR IGNORE INTO recalls VALUES (?, ?)", (thread, server_id))
+            self.db.execute(
+                "UPDATE messages SET status='recalled' WHERE thread=? AND "
+                "((? IS NOT NULL AND server_id=?) OR (? IS NULL AND id=?))",
+                (thread, server_id, server_id, server_id, message_id),
+            )
+            if message_id:
+                self.db.execute(
+                    "INSERT OR IGNORE INTO messages VALUES (?, ?, ?, 'recalled')",
+                    (message_id, thread, server_id),
+                )
+
+    def begin_send(self, key: str, message_id: str | None, thread: str):
+        with self.db:
+            self.db.execute(
+                "UPDATE messages SET status='queued' WHERE id=? AND status='no_reply'",
+                (message_id,),
+            )
+            self.db.execute(
+                "INSERT INTO sends VALUES (?, ?, ?, 'submitting', NULL)", (key, message_id, thread)
+            )
+
+    def finish_send(self, key: str, state: str, send_id: str | None):
+        with self.db:
+            self.db.execute(
+                "UPDATE sends SET state=?, send_id=COALESCE(?, send_id) WHERE key=?",
+                (state, send_id, key),
+            )
+
+    def record_send_id(self, key: str, send_id: str):
+        """Retain an asynchronous media job before polling or process shutdown."""
+        with self.db:
+            self.db.execute("UPDATE sends SET send_id=? WHERE key=?", (send_id, key))
+
+    def send_record(self, key: str) -> dict | None:
+        row = self.db.execute("SELECT * FROM sends WHERE key=?", (key,)).fetchone()
+        return dict(row) if row else None
+
+    def record_voice_chunks(self, key: str, chunks: list):
+        """Journal Native's per-note receipts without retaining audio or transcripts."""
+        with self.db:
+            count = self.db.execute(
+                "SELECT COUNT(*) FROM send_chunks WHERE key=?", (key,)
+            ).fetchone()[0]
+            if count > len(chunks):
+                raise StateIdentityError(
+                    "Native voice receipts disappeared; inspect the retained job"
+                )
+            for chunk in chunks:
+                existing = self.db.execute(
+                    "SELECT * FROM send_chunks WHERE key=? AND part=?", (key, chunk["index"])
+                ).fetchone()
+                if existing and (
+                    existing["duration_ms"] != chunk["durationMs"]
+                    or (existing["state"] == "accepted" and chunk["state"] != "accepted")
+                    or (
+                        existing["server_id"] is not None
+                        and existing["server_id"] != chunk.get("serverMessageId")
+                    )
+                ):
+                    raise StateIdentityError(
+                        "Native voice receipt changed; inspect the retained job"
+                    )
+                self.db.execute(
+                    "INSERT INTO send_chunks VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(key, part) DO UPDATE SET state=excluded.state, "
+                    "server_id=COALESCE(excluded.server_id, send_chunks.server_id)",
+                    (
+                        key,
+                        chunk["index"],
+                        chunk["state"],
+                        chunk["durationMs"],
+                        chunk.get("serverMessageId"),
+                    ),
+                )
+
+    def voice_chunks(self, key: str) -> list[dict]:
+        return [
+            dict(row)
+            for row in self.db.execute(
+                "SELECT * FROM send_chunks WHERE key=? ORDER BY part", (key,)
+            )
+        ]
+
+    def close(self):
+        self.db.close()
