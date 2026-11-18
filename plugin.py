@@ -44,6 +44,9 @@ from .tools import ToolUnavailable, WechatNativeTools, describe_error, tool_name
 
 GATEWAY_NAME = "wechat_native_gateway"
 MEDIA_RETRY_SECONDS = 3
+GROUP_NAME_TTL_SECONDS = 600.0
+PENDING_SOURCE_LIMIT = 512
+CURSOR_PROBE_SECONDS = 4.0
 ALL_TOOL_NAMES = (
     "wechat_search_history",
     "wechat_group_info",
@@ -85,6 +88,8 @@ class WeChatNativePlugin(MaiBotPlugin):
         self._status = "尚未连接"
         self._stopping = False
         self._pending_source: Dict[str, Dict[str, str]] = {}
+        self._group_names: Dict[str, tuple[str, float]] = {}
+        self._member_names: Dict[str, tuple[str, float]] = {}
         self._admin_client: Optional[NativeClient] = None
         self._tools = WechatNativeTools(self)
         self._login = LoginSession()
@@ -288,6 +293,11 @@ class WeChatNativePlugin(MaiBotPlugin):
             self._admin_client = NativeClient(native.api_url, native.account_id, admin_token)
         self._stopping = False
         self._status = "等待连接 Native"
+        logger.info(
+            "WeChat Native 适配器启动: account=%s admin=%s",
+            native.account_id,
+            "yes" if admin_token else "no",
+        )
         self._worker = asyncio.create_task(self._run(), name="wechat-native-adapter")
 
     async def _stop(self) -> None:
@@ -342,9 +352,11 @@ class WeChatNativePlugin(MaiBotPlugin):
 
         native = self._native
         if native is None:
+            logger.error("WeChat Native 接收任务缺少配置，无法启动")
             return
         store = self._require_store()
         delay = native.reconnect_delay_seconds
+        logger.info("WeChat Native 开始接收事件: cursor=%s", store.cursor)
         try:
             client = NativeClient(native.api_url, native.account_id, native.load_token())
             self._client = client
@@ -362,19 +374,26 @@ class WeChatNativePlugin(MaiBotPlugin):
                     else:
                         await self._set_ready(True, f"{self._self_id}（微信已在线）")
                     await self._guard_cursor(client, store)
-                    await self._guard_cursor(client, store)
+                    await self._ensure_cursor_in_window(client, store)
                     async for event in client.events(store.cursor):
                         await self._process_event(event, store)
                         delay = native.reconnect_delay_seconds
                     if not self._stopping:
                         logger.warning("WeChat Native 事件流已断开，使用已保存游标重连")
                 except NativeAPIError as error:
-                    if error.status in {401, 403, 410}:
+                    if error.status in {401, 403}:
                         await self._set_ready(False, f"Native 拒绝连接（HTTP {error.status}）")
                         logger.error("WeChat Native 停止接收: HTTP %s (%s)", error.status, error.code)
                         raise
-                    await self._set_ready(False, f"Native 暂时不可达（HTTP {error.status}），等待重连")
-                    logger.warning("WeChat Native 暂时不可达，将重连（HTTP %s）", error.status)
+                    if error.status == 410:
+                        # 事件日志被服务端重置后旧游标永久失效，必须回到最新位置，
+                        # 否则会一直卡在同一个 410 上再也收不到消息。
+                        await self._reset_cursor(client, store)
+                        await self._set_ready(False, "事件游标已过期，已重置到最新位置")
+                        logger.warning("WeChat Native 事件游标过期，已重置到最新位置")
+                    else:
+                        await self._set_ready(False, f"Native 暂时不可达（HTTP {error.status}），等待重连")
+                        logger.warning("WeChat Native 暂时不可达，将重连（HTTP %s）", error.status)
                 except ValueError as error:
                     await self._set_ready(False, "消息身份校验失败，保留游标等待重试")
                     logger.error("WeChat Native 收到无效消息身份: %s", error)
@@ -407,10 +426,73 @@ class WeChatNativePlugin(MaiBotPlugin):
             store: 状态存储。
 
         Raises:
-            NativeAPIError: 游标已失效（410）时向上抛出，由外层决定停止接收。
+            NativeAPIError: 游标已失效（410）时向上抛出，由外层重置游标。
         """
 
         await client.events_probe(store.cursor)
+
+    async def _ensure_cursor_in_window(self, client: NativeClient, store: StateStore) -> None:
+        """确认保存的游标仍能读到事件。
+
+        Native 的事件流是滚动窗口：游标远大于窗口上界时不会返回 410，
+        而是直接给出一条都读不到的空流，导致适配器静默收不到任何消息。
+
+        注意不能用“窗口最大游标”判断越界：``after=0`` 只会按顺序推送，
+        短时间读取到的最大游标远小于真实上界，据此判断会误判。
+
+        Args:
+            client: 已连接的 Native 客户端。
+            store: 状态存储。
+        """
+
+        if await self._cursor_has_events(client, store.cursor):
+            return
+        if not await self._cursor_has_events(client, "0"):
+            # 服务端本身没有事件可读，不是游标问题。
+            return
+        current = store.cursor
+        logger.warning("微信事件游标 %s 已读不到事件，回到事件窗口起点", current)
+        store.advance_reset("0")
+
+    async def _cursor_has_events(self, client: NativeClient, cursor: str) -> bool:
+        """判断从指定游标能否读到至少一条事件。
+
+        Args:
+            client: 已连接的 Native 客户端。
+            cursor: 起始游标。
+
+        Returns:
+            bool: 读到事件返回 ``True``。
+        """
+
+        stream = client.events(cursor)
+        try:
+            async with asyncio.timeout(CURSOR_PROBE_SECONDS):
+                async for _ in stream:
+                    return True
+        except (TimeoutError, NativeAPIError, asyncio.CancelledError):
+            return False
+        finally:
+            await stream.aclose()
+        return False
+
+    async def _reset_cursor(self, client: NativeClient, store: StateStore) -> None:
+        """把失效的游标重置到服务端当前最新位置。
+
+        Native 的事件日志被重置后旧游标永久失效，继续使用只会反复得到 410。
+        这里直接读取事件流当前可见的最大游标并写入状态库。
+
+        Args:
+            client: 已连接的 Native 客户端。
+            store: 状态存储。
+        """
+
+        latest = await client.latest_cursor()
+        if latest is None:
+            logger.warning("微信事件游标重置失败：无法读取服务端最新游标")
+            return
+        store.advance_reset(str(latest))
+        logger.warning("微信事件游标已重置到 %s", latest)
 
     async def _process_event(self, event: Dict[str, Any], store: StateStore) -> None:
         """处理单条 Native 事件并推进游标。
@@ -551,13 +633,21 @@ class WeChatNativePlugin(MaiBotPlugin):
             elif pdf_name:
                 text = DEFAULT_PDF_PROMPT
         quote = raw.get("quote") if isinstance(raw.get("quote"), dict) else None
+        group_name = str(raw.get("groupName") or "")
+        if group and not group_name:
+            group_name = await self._group_name(client, thread)
+        if not str(raw.get("senderName") or "").strip():
+            # 部分历史消息不带 senderName，用群成员资料补昵称，避免把 wxid 当名字。
+            nickname = await self._member_name(client, thread, sender)
+            if nickname:
+                raw = {**raw, "senderName": nickname}
         message = inbound(
             raw,
             native.account_id,
             text=text,
             segments=segments,
             self_id=self._self_id,
-            group_name=str(raw.get("groupName") or ""),
+            group_name=group_name,
             quote=quote,
         )
         try:
@@ -579,6 +669,10 @@ class WeChatNativePlugin(MaiBotPlugin):
             "messageId": str(raw["id"]),
             "serverId": str(raw.get("serverId") or ""),
         }
+        # 只保留最近的一批触发消息：宿主可能长时间不回复，
+        # 不设上限会让这张表随运行时间无限增长。
+        while len(self._pending_source) > PENDING_SOURCE_LIMIT:
+            self._pending_source.pop(next(iter(self._pending_source)))
         accepted = await self.ctx.gateway.route_message(
             GATEWAY_NAME,
             message,
@@ -591,6 +685,74 @@ class WeChatNativePlugin(MaiBotPlugin):
             store.mark_message(external_id, "no_reply")
             logger.info("麦麦过滤或去重了微信消息: %s", external_id)
         return True
+
+    async def _group_name(self, client: NativeClient, thread: str) -> str:
+        """读取并缓存微信群名称。
+
+        Native 的消息对象不带群名，只能查群资料；每条消息都查会明显变慢，
+        因此按会话缓存一段时间。
+
+        Args:
+            client: Native 客户端。
+            thread: 群会话 ID。
+
+        Returns:
+            str: 群名称；读取失败时返回空字符串。
+        """
+
+        cached = self._group_names.get(thread)
+        now = asyncio.get_running_loop().time()
+        if cached is not None and now - cached[1] < GROUP_NAME_TTL_SECONDS:
+            return cached[0]
+        try:
+            info = await client.group(thread)
+        except (NativeAPIError, MediaError) as error:
+            logger.info("读取微信群资料失败: thread=%s error=%s", thread, error)
+            return cached[0] if cached is not None else ""
+        name = str(info.get("name") or info.get("displayName") or "").strip()
+        if name and not is_group_thread(name):
+            self._group_names[thread] = (name, now)
+            return name
+        # 群名未同步时不要用 chatroom ID 冒充名称，让宿主自己回退。
+        self._group_names[thread] = ("", now)
+        return ""
+
+    async def _member_name(self, client: NativeClient, thread: str, user_id: str) -> str:
+        """按用户 ID 查群昵称或昵称。
+
+        Args:
+            client: Native 客户端。
+            thread: 群会话 ID；私聊时传空字符串。
+            user_id: 微信用户 ID。
+
+        Returns:
+            str: 昵称；查不到时返回空字符串。
+        """
+
+        if not user_id:
+            return ""
+        cached = self._member_names.get(user_id)
+        now = asyncio.get_running_loop().time()
+        if cached is not None and now - cached[1] < GROUP_NAME_TTL_SECONDS:
+            return cached[0]
+        name = ""
+        if thread and is_group_thread(thread):
+            try:
+                page = await client.group_members(thread, limit=200)
+            except (NativeAPIError, MediaError) as error:
+                logger.info("读取微信群成员失败: thread=%s error=%s", thread, error)
+                page = {}
+            for item in page.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("username") or item.get("id") or "") != user_id:
+                    continue
+                name = str(
+                    item.get("roomDisplayName") or item.get("displayName") or ""
+                ).strip()
+                break
+        self._member_names[user_id] = (name, now)
+        return name
 
     async def _load_media(
         self, native: NativeConfig, raw: Dict[str, Any], client: NativeClient
@@ -895,6 +1057,9 @@ class WeChatNativePlugin(MaiBotPlugin):
     ) -> Dict[str, str]:
         """解析当前工具调用所属的微信会话并校验权限。
 
+        宿主只在群聊时传 ``group_id``，私聊只有 ``stream_id``（麦麦会话 ID），
+        因此拿不到微信会话时必须按会话反查，否则私聊工具会全部失效。
+
         Args:
             kwargs: 宿主传入的工具参数，含当前聊天上下文。
             require_group: 是否要求当前会话是群聊。
@@ -918,6 +1083,8 @@ class WeChatNativePlugin(MaiBotPlugin):
             thread = str(
                 (kwargs.get("message_info") or {}).get("additional_config", {}).get("wechat_thread_id") or ""
             ).strip()
+        if not thread:
+            thread = await self._thread_from_stream(kwargs, sender)
         if require_group and thread and not is_group_thread(thread):
             raise ValueError("该工具仅支持微信群聊")
         if require_group and not thread:
@@ -925,6 +1092,46 @@ class WeChatNativePlugin(MaiBotPlugin):
         if admin:
             self._tools.check_admin(sender)
         return {"thread": thread, "sender": sender}
+
+    async def _thread_from_stream(self, kwargs: Dict[str, Any], sender: str) -> str:
+        """按麦麦会话 ID 反查真实的微信会话 ID。
+
+        宿主的工具上下文只有 ``stream_id``，它对应麦麦的聊天流而不是微信 threadId。
+        这里用 chat 能力把聊天流还原成微信群 ID 或好友 wxid。
+
+        Args:
+            kwargs: 工具调用参数。
+            sender: 发起工具的微信用户 ID。
+
+        Returns:
+            str: 微信会话 ID；无法确定时返回空字符串。
+        """
+
+        stream_id = str(kwargs.get("stream_id") or kwargs.get("chat_id") or "").strip()
+        if not stream_id:
+            return ""
+        chat = getattr(self.ctx, "chat", None)
+        if chat is None:
+            return ""
+        try:
+            streams = await chat.get_all_streams(platform=PLATFORM)
+        except Exception as error:  # noqa: BLE001 - 反查失败由调用方给出提示
+            logger.info("按会话反查微信聊天流失败: %s", error)
+            return ""
+        for item in _iter_streams(streams):
+            session_id = str(item.get("session_id") or item.get("stream_id") or "")
+            if session_id != stream_id:
+                continue
+            group_id = str(item.get("group_id") or "").strip()
+            if group_id:
+                return group_id
+            user_id = str(item.get("user_id") or "").strip()
+            if user_id:
+                return user_id
+        if sender:
+            # 私聊流的目标就是发起者本人，用它作为微信会话 ID。
+            return sender
+        return ""
 
     @MessageGateway(
         name=GATEWAY_NAME,
@@ -1001,20 +1208,46 @@ class WeChatNativePlugin(MaiBotPlugin):
                     sent.append(key)
                     # 宿主用这个 ID 回写自己的消息记录，撤回工具依赖它定位消息，
                     # 因此必须是 Native 的真实消息 ID，不能是幂等键。
-                    external_ids.append(
-                        str(
-                            receipt.get("localMessageId")
-                            or receipt.get("messageId")
-                            or receipt.get("serverId")
-                            or ""
-                        )
-                    )
+                    # 群 @ 消息的受理回执不带 localMessageId，需要按幂等键回查。
+                    message_id = _receipt_message_id(receipt)
+                    if not message_id:
+                        message_id = await self._lookup_message_id(client, key)
+                    external_ids.append(message_id)
                 last = next((value for value in reversed(external_ids) if value), "")
                 self._mark_replied(message)
                 return {"success": True, "external_message_id": last, "metadata": {"send_keys": sent}}
             except (NativeAPIError, SendError, MediaError, ValueError) as error:
                 logger.warning("微信出站失败: %s", error)
                 return {"success": False, "error": str(error)}
+
+    async def _lookup_message_id(self, client: NativeClient, key: str) -> str:
+        """按幂等键回查已发送消息的真实 ID。
+
+        部分发送（例如群聊 @）的受理回执不带 ``localMessageId``，
+        只能按幂等键反查发送记录补回消息 ID。
+
+        Args:
+            client: Native 客户端。
+            key: 发送时使用的幂等键。
+
+        Returns:
+            str: 消息 ID；查不到时返回空字符串。
+        """
+
+        # 消息落库有时间差，回查不到时短暂重试几次。
+        for attempt in range(3):
+            try:
+                record = await client.send_by_key(key)
+            except (NativeAPIError, SendError) as error:
+                logger.info("按幂等键回查微信发送记录失败: %s", error)
+                return ""
+            if isinstance(record, dict):
+                message_id = _receipt_message_id(record)
+                if message_id:
+                    return message_id
+            if attempt < 2:
+                await asyncio.sleep(0.3)
+        return ""
 
     def _reply_source_key(self, message: Dict[str, Any]) -> str:
         """找出触发本次回复的入站消息 ID。
@@ -1070,7 +1303,9 @@ class WeChatNativePlugin(MaiBotPlugin):
         """
 
         del client
-        quote = {"messageId": reply_id, "serverId": reply_id} if reply_id else None
+        # Native 引用要求 messageId 与 serverId 是两个不同的值；
+        # 只拿到 reply_id 时无法拼出合法的引用参数，直接放弃引用。
+        quote = None
         if not is_group_thread(target) or not source or native.group_reply_style == "plain":
             return mentions, reply_id, quote
         if mentions or reply_id:
@@ -1079,8 +1314,8 @@ class WeChatNativePlugin(MaiBotPlugin):
         if not has_text:
             return mentions, reply_id, quote
         if native.group_reply_style == "quote":
-            message_id = source.get("messageId")
-            server_id = source.get("serverId")
+            message_id = str(source.get("messageId") or "")
+            server_id = str(source.get("serverId") or "")
             if message_id and server_id:
                 reply_id = message_id
                 quote = {"messageId": message_id, "serverId": server_id}
@@ -1116,10 +1351,74 @@ class WeChatNativePlugin(MaiBotPlugin):
         pending = store.latest_pending_message(native.account_id, thread)
         if pending:
             store.mark_message(pending, "replied")
+        # 触发消息已经用掉，清掉对应记录，避免后续回复误用陈旧引用。
+        source_key = self._reply_source_key(message)
+        if source_key:
+            self._pending_source.pop(source_key, None)
+
+
+def _receipt_message_id(receipt: Any) -> str:
+    """从 Native 发送回执里取出真实消息 ID。
+
+    文本发送把消息 ID 放在顶层，媒体发送则放在 ``result.messageIds`` 里。
+
+    Args:
+        receipt: ``send_text`` / ``send_image`` / ``send_voice`` 的返回值。
+
+    Returns:
+        str: 消息 ID；取不到时返回空字符串。
+    """
+
+    if not isinstance(receipt, dict):
+        return ""
+    for key in ("localMessageId", "messageId"):
+        value = str(receipt.get(key) or "").strip()
+        if value:
+            return value
+    result = receipt.get("result")
+    if isinstance(result, dict):
+        message_ids = result.get("messageIds")
+        if isinstance(message_ids, list):
+            for item in message_ids:
+                value = str(item or "").strip()
+                if value:
+                    return value
+        value = str(result.get("messageId") or "").strip()
+        if value:
+            return value
+    return ""
 
 
 async def _noop_async() -> None:
     """Native 媒体发送前的占位回调。"""
+
+
+def _iter_streams(value: Any) -> List[Dict[str, Any]]:
+    """把宿主返回的聊天流结果整理成字典列表。
+
+    宿主成功时直接返回聊天流列表，失败时返回带 ``success=False`` 的信封。
+
+    Args:
+        value: ``ctx.chat.get_all_streams`` 的返回值。
+
+    Returns:
+        List[Dict[str, Any]]: 聊天流字典列表。
+
+    Raises:
+        RuntimeError: 宿主明确返回查询失败。
+    """
+
+    if isinstance(value, dict):
+        if value.get("success") is False:
+            raise RuntimeError(f"查询微信聊天流失败: {value.get('error')}")
+        for key in ("streams", "items", "data"):
+            nested = value.get(key)
+            if isinstance(nested, list):
+                return [item for item in nested if isinstance(item, dict)]
+        return [value] if value else []
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    return []
 
 
 def queue_message(store: StateStore, account: str, raw: Dict[str, Any], external_id: str) -> None:

@@ -218,6 +218,57 @@ class WechatNativeTools:
             "detail": detail,
         }
 
+    async def _await_operation(
+        self, client: NativeClient, operation: Dict[str, Any], *, label: str
+    ) -> tuple[str, Dict[str, Any]]:
+        """轮询 Native 写操作直到得出确定结论。
+
+        Native 受理写操作只代表排队成功，必须等到 ``state == succeeded``
+        且 ``remoteOutcome`` 为 accepted/confirmed 才算真正生效。
+
+        Args:
+            client: Native 客户端。
+            operation: 写操作接口返回的操作对象。
+            label: 操作名称，用于错误提示。
+
+        Returns:
+            tuple[str, Dict[str, Any]]: 状态与最后一次操作详情。
+
+        Raises:
+            ValueError: 操作被拒绝或结果无法确认。
+        """
+
+        operation_id = str(operation.get("id") or "")
+        current = operation
+        for _ in range(20):
+            state = str(current.get("state") or "")
+            payload = current.get("result") if isinstance(current.get("result"), dict) else {}
+            remote = str(payload.get("remoteOutcome") or "")
+            if state == "succeeded" and remote in {"accepted", "confirmed"}:
+                return "succeeded", current
+            if state == "failed":
+                code = str(payload.get("code") or remote or "unknown")
+                service_code = payload.get("serviceCode")
+                status = str(payload.get("status") or "")
+                if status == "not_eligible" or service_code == -430:
+                    raise ValueError(
+                        f"微信拒绝了{label}：只能撤回发送后 2 分钟内的消息，"
+                        "超时后微信不再允许撤回"
+                    )
+                if remote in {"not_attempted", "rejected"}:
+                    raise ValueError(f"微信未执行{label}（{code}）")
+                raise ValueError(f"{label}失败（{code}）")
+            if not operation_id:
+                break
+            await asyncio.sleep(0.5)
+            try:
+                current = await client.operation(operation_id)
+            except NativeAPIError:
+                break
+        payload = current.get("result") if isinstance(current.get("result"), dict) else {}
+        remote = str(payload.get("remoteOutcome") or "unknown")
+        raise ValueError(f"{label}结果未确认（remoteOutcome={remote}），请稍后在微信中确认")
+
     async def _await_recall(
         self, client: NativeClient, operation: Dict[str, Any]
     ) -> tuple[str, Dict[str, Any]]:
@@ -234,36 +285,11 @@ class WechatNativeTools:
             tuple[str, Dict[str, Any]]: 状态与最后一次操作详情。
         """
 
-        operation_id = str(operation.get("id") or "")
-        current = operation
-        for _ in range(20):
-            state = str(current.get("state") or "")
-            payload = current.get("result") if isinstance(current.get("result"), dict) else {}
-            remote = str(payload.get("remoteOutcome") or "")
-            if state == "succeeded" and remote in {"accepted", "confirmed"}:
-                return ("already_recalled" if payload.get("status") == "already_recalled" else "recalled"), current
-            if state == "failed":
-                code = str(payload.get("code") or remote or "unknown")
-                service_code = payload.get("serviceCode")
-                status = str(payload.get("status") or "")
-                if status == "not_eligible" or service_code == -430:
-                    raise ValueError(
-                        "微信拒绝了撤回：只能撤回发送后 2 分钟内的消息，"
-                        "超时后微信不再允许撤回"
-                    )
-                if remote in {"not_attempted", "rejected"}:
-                    raise ValueError(f"微信未执行撤回（{code}），该消息可能已过期或不允许撤回")
-                raise ValueError(f"撤回失败（{code}）")
-            if not operation_id:
-                break
-            await asyncio.sleep(0.5)
-            try:
-                current = await client.operation(operation_id)
-            except NativeAPIError:
-                break
+        status, current = await self._await_operation(client, operation, label="撤回")
         payload = current.get("result") if isinstance(current.get("result"), dict) else {}
-        remote = str(payload.get("remoteOutcome") or "unknown")
-        raise ValueError(f"撤回结果未确认（remoteOutcome={remote}），请稍后在微信中确认")
+        if status == "succeeded" and payload.get("status") == "already_recalled":
+            return "already_recalled", current
+        return "recalled", current
 
     async def _find_message(
         self, client: NativeClient, given: str, raw_id: str, thread: str
@@ -344,8 +370,11 @@ class WechatNativeTools:
 
         thread = require_thread(thread)
         name = clean_text(nickname, label="群昵称", maximum=512)
-        operation = await self._admin_client().set_my_group_name(thread, name)
-        return {"success": True, "group_id": thread, "nickname": name, "operation": operation}
+        client = self._admin_client()
+        operation = await client.set_my_group_name(thread, name, secrets.token_hex(16))
+        # 受理不等于生效，必须等到 Native 明确返回成功。
+        await self._await_operation(client, operation, label="修改群昵称")
+        return {"success": True, "group_id": thread, "nickname": name}
 
     async def rename_group(self, thread: str, name: str) -> Dict[str, Any]:
         """修改群名称。
@@ -360,8 +389,10 @@ class WechatNativeTools:
 
         thread = require_thread(thread)
         group_name = clean_text(name, label="群名", maximum=512)
-        operation = await self._admin_client().rename_group(thread, group_name)
-        return {"success": True, "group_id": thread, "name": group_name, "operation": operation}
+        client = self._admin_client()
+        operation = await client.rename_group(thread, group_name, secrets.token_hex(16))
+        await self._await_operation(client, operation, label="修改群名")
+        return {"success": True, "group_id": thread, "name": group_name}
 
     async def get_group_info(self, thread: str) -> Dict[str, Any]:
         """读取群资料。
@@ -374,7 +405,8 @@ class WechatNativeTools:
         """
 
         thread = require_thread(thread)
-        return await self._client().group(thread)
+        raw = await self._client().group(thread)
+        return _project_group(raw)
 
     async def list_group_members(
         self, thread: str, limit: Any = 50, search: str = ""
@@ -391,9 +423,10 @@ class WechatNativeTools:
         """
 
         thread = require_thread(thread)
-        return await self._client().group_members(
+        raw = await self._client().group_members(
             thread, limit=clamp_limit(limit, default=50, maximum=200), search=str(search or "").strip()
         )
+        return _project_members(raw)
 
     async def search_history(
         self, thread: str, query: str = "", limit: Any = 20
@@ -412,9 +445,10 @@ class WechatNativeTools:
         normalized = str(thread or "").strip()
         if not normalized:
             raise ValueError("当前会话缺少微信会话 ID，无法读取历史消息")
-        return await self._client().messages(
+        raw = await self._client().messages(
             normalized, limit=clamp_limit(limit, default=20, maximum=50), query=str(query or "").strip()
         )
+        return _project_messages(raw)
 
     async def search_contact(self, query: str) -> Dict[str, Any]:
         """按关键词搜索微信联系人。
@@ -468,8 +502,93 @@ class WechatNativeTools:
         version = str(detail.get("version") or "")
         if not version:
             raise ValueError("该好友申请缺少版本信息，无法接受")
-        operation = await admin.accept_contact_request(identifier, version)
-        return {"success": True, "status": "accepted", "request_id": identifier, "operation": operation}
+        operation = await admin.accept_contact_request(identifier, version, secrets.token_hex(16))
+        await self._await_operation(admin, operation, label="接受好友申请")
+        return {"success": True, "status": "accepted", "request_id": identifier}
+
+
+def _project_group(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """把群资料精简成模型需要的字段。
+
+    Native 的返回夹带数据库覆盖信息等内部元数据，直接交给模型既浪费上下文
+    也容易泄露本机路径。
+
+    Args:
+        raw: Native 群资料响应。
+
+    Returns:
+        Dict[str, Any]: 精简后的群资料。
+    """
+
+    name = str(raw.get("name") or "").strip() or str(raw.get("remark") or "").strip()
+    display = str(raw.get("displayName") or "").strip()
+    return {
+        "group_id": str(raw.get("id") or ""),
+        "name": name or display,
+        "owner_id": str(raw.get("ownerId") or ""),
+        "announcement": str(raw.get("announcement") or ""),
+        "my_display_name": str(raw.get("myDisplayName") or ""),
+        "administrator_count": len(raw.get("administratorIds") or []),
+    }
+
+
+def _project_members(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """把群成员列表精简成模型需要的字段。
+
+    Args:
+        raw: Native 群成员响应。
+
+    Returns:
+        Dict[str, Any]: 精简后的成员列表与分页游标。
+    """
+
+    members: List[Dict[str, str]] = []
+    for item in raw.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        members.append(
+            {
+                "user_id": str(item.get("username") or item.get("id") or ""),
+                "display_name": str(item.get("displayName") or ""),
+                "group_nickname": str(item.get("roomDisplayName") or ""),
+            }
+        )
+    result: Dict[str, Any] = {"members": members}
+    next_cursor = str(raw.get("nextCursor") or "")
+    if next_cursor:
+        result["next_cursor"] = next_cursor
+    return result
+
+
+def _project_messages(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """把历史消息精简成模型需要的字段。
+
+    Args:
+        raw: Native 历史消息响应。
+
+    Returns:
+        Dict[str, Any]: 精简后的消息列表与分页游标。
+    """
+
+    messages: List[Dict[str, Any]] = []
+    for item in raw.get("items") or []:
+        if not isinstance(item, dict) or item.get("deleted") is True:
+            continue
+        messages.append(
+            {
+                "message_id": str(item.get("id") or ""),
+                "sender_id": str(item.get("senderId") or ""),
+                "direction": str(item.get("direction") or ""),
+                "timestamp": str(item.get("createdAt") or ""),
+                "type": item.get("type"),
+                "text": str(item.get("body") or ""),
+            }
+        )
+    result: Dict[str, Any] = {"messages": messages}
+    next_cursor = str(raw.get("nextCursor") or "")
+    if next_cursor:
+        result["next_cursor"] = next_cursor
+    return result
 
 
 def describe_error(error: Exception) -> Dict[str, Any]:

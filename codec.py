@@ -172,12 +172,15 @@ def inbound(
     if quote is not None:
         quoted = str(quote.get("text") or "").strip()
         if quoted:
-            text_with_quote = f"[引用消息] {quoted}\n{body}" if body else f"[引用消息] {quoted}"
+            author = str(quote.get("senderName") or "").strip()
+            prefix = f"[引用消息｜{author}]" if author else "[引用消息]"
+            text_with_quote = f"{prefix} {quoted}\n{body}" if body else f"{prefix} {quoted}"
     if text_with_quote.strip():
         raw_segments.append({"type": "text", "data": text_with_quote})
     raw_segments.extend(segments)
+    nickname = str(raw.get("senderName") or "").strip() or str(sender)
     info: Dict[str, Any] = {
-        "user_info": {"user_id": str(sender), "user_nickname": str(sender)},
+        "user_info": {"user_id": str(sender), "user_nickname": nickname},
         "additional_config": {"wechat_thread_id": thread, "wechat_mentioned": bool(mentioned)},
     }
     if group:
