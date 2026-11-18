@@ -38,7 +38,9 @@
   ],
   "capabilities": [
     "gateway.route_message",
-    "gateway.update_state"
+    "gateway.update_state",
+    "component.enable",
+    "component.disable"
   ],
   "i18n": {
     "default_locale": "zh-CN",

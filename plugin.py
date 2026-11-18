@@ -429,17 +429,27 @@ class WeChatNativePlugin(MaiBotPlugin):
         """
 
         kind = event.get("kind")
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
         if kind == "message.recalled":
-            data = event.get("data") or {}
             store.recall(
                 str(data.get("threadId") or ""),
                 str(data.get("serverId") or "") or None,
                 str(data.get("messageId") or "") or None,
             )
             return
-        if kind not in {"message", "message.created", "message.received"}:
+        # Native 对已落库的消息统一发 message.committed，事件体只带 ID 与方向，
+        # 正文与发送者需要再按 messageId 取一次。
+        if kind != "message.committed":
             return
-        raw = event.get("data")
+        if data.get("direction") != "incoming":
+            return
+        message_id = str(data.get("messageId") or "").strip()
+        if not message_id:
+            return
+        client = self._client
+        if client is None:
+            raise RuntimeError("WeChat Native 客户端未就绪")
+        raw = await client.message(message_id)
         if not isinstance(raw, dict) or not raw.get("threadId") or not raw.get("senderId"):
             return
         await self._receive_message(raw, store)
