@@ -740,7 +740,7 @@ class WeChatNativePlugin(MaiBotPlugin):
         description=(
             "仅用于微信：撤回机器人自己发送的一条消息。私聊和群聊都可以用，"
             "但只能撤回机器人自己的消息，不能撤回他人消息。"
-            "不传 msg_id 时撤回本会话中机器人最近发送的一条。"
+            "msg_id 使用聊天记录中的消息 ID；不传时撤回当前会话里机器人最近发送的一条。"
             "注意微信没有禁言或踢人能力。"
         ),
         parameters=[
@@ -751,10 +751,51 @@ class WeChatNativePlugin(MaiBotPlugin):
         """在工具调用中撤回机器人自己发送的消息。"""
 
         try:
-            stream = await self._tool_stream(kwargs, admin=True)
-            return await self._tools.recall_message(stream["thread"], kwargs.get("msg_id", ""))
+            self._tools.check_admin(str(kwargs.get("user_id") or ""))
+            thread, message_id = await self._resolve_recall_target(kwargs)
+            return await self._tools.recall_message(thread, message_id)
         except Exception as error:
             return describe_error(error)
+
+    async def _resolve_recall_target(self, kwargs: Dict[str, Any]) -> tuple[str, str]:
+        """解析撤回目标的消息与会话。
+
+        参照 QQ 适配器：优先用宿主消息记录反查消息所属会话，
+        只有在拿不到消息时才退回当前聊天上下文。
+
+        Args:
+            kwargs: 工具调用参数。
+
+        Returns:
+            tuple[str, str]: ``(会话 ID, 消息 ID)``，均可能为空。
+        """
+
+        message_id = str(kwargs.get("msg_id") or "").strip()
+        stream_id = str(kwargs.get("stream_id") or "")
+        thread = str(kwargs.get("group_id") or kwargs.get("target_id") or "").strip()
+        if message_id:
+            try:
+                record = await self.ctx.message.get_by_id(
+                    message_id, stream_id=stream_id, include_binary_data=False
+                )
+            except Exception as error:  # noqa: BLE001 - 查不到时退回上下文
+                logger.info("按消息 ID 反查微信会话失败，退回当前上下文: %s", error)
+            else:
+                info = record.get("message_info") if isinstance(record, dict) else None
+                if isinstance(info, dict):
+                    group_info = info.get("group_info")
+                    if isinstance(group_info, dict) and group_info.get("group_id"):
+                        thread = str(group_info["group_id"])
+                    else:
+                        extra = info.get("additional_config") or {}
+                        thread = str(
+                            extra.get("wechat_thread_id")
+                            or extra.get("platform_io_target_user_id")
+                            or thread
+                        ).strip()
+        if not thread:
+            thread = str(kwargs.get("wechat_thread_id") or "").strip()
+        return thread, message_id
 
     @Tool(
         "wechat_set_my_group_nickname",

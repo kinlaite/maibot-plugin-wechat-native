@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional
 
 import unicodedata
 
+import secrets
+
 from .codec import is_group_thread
 from .config import NativeConfig
 from .log import logger
@@ -159,11 +161,14 @@ class WechatNativeTools:
         if sender_id not in native.wechat_action_admins:
             raise ToolUnavailable("当前用户不在微信写操作管理员白名单内")
 
-    async def recall_message(self, thread: str, message_id: str = "") -> Dict[str, Any]:
+    async def recall_message(self, thread: str = "", message_id: str = "") -> Dict[str, Any]:
         """撤回机器人自己发送的消息。
 
+        参照 QQ 适配器的做法：会话优先从目标消息自身解析，
+        只有未指定消息时才退回按会话查找最近一条。
+
         Args:
-            thread: 当前会话 ID。
+            thread: 当前会话 ID，可为空。
             message_id: 目标消息 ID；留空表示最近一条自己发的消息。
 
         Returns:
@@ -174,16 +179,23 @@ class WechatNativeTools:
         client = self._client()
         admin = self._admin_client()
         thread = str(thread or "").strip()
-        if not thread:
-            raise ValueError("当前会话缺少微信会话 ID，无法撤回")
         target = str(message_id or "").strip()
         if target:
             record = await client.message(target)
+            # 会话以消息自身的 threadId 为准，不依赖宿主是否传入会话 ID。
+            resolved = str(record.get("threadId") or "").strip() or thread
+            if not resolved:
+                raise ValueError("目标消息缺少会话信息，无法撤回")
+            if thread and resolved != thread:
+                raise ValueError("目标消息不属于当前微信会话")
+            thread = resolved
         else:
+            if not thread:
+                raise ValueError("请指定要撤回的消息，或从具体聊天中发起撤回")
             record = await self._latest_own_message(client, native, thread)
             target = str(record.get("id") or "")
-        if record.get("accountId") != native.account_id or record.get("threadId") != thread:
-            raise ValueError("目标消息不属于当前微信会话")
+        if record.get("accountId") != native.account_id:
+            raise ValueError("目标消息不属于当前微信账号")
         if record.get("direction") != "outgoing":
             raise ValueError("只能撤回机器人自己发送的消息")
         if record.get("recall") is not None:
@@ -191,7 +203,7 @@ class WechatNativeTools:
         server_id = str(record.get("serverId") or "")
         if not server_id.isdigit():
             raise ValueError("目标消息缺少可撤回的服务端 ID，可能已过期")
-        operation = await admin.recall_message(target, server_id)
+        operation = await admin.recall_message(target, server_id, secrets.token_hex(16))
         self._plugin._store.recall(thread, server_id, target)
         return {"success": True, "status": "recalled", "message_id": target, "operation": operation}
 
