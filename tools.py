@@ -211,7 +211,12 @@ class WechatNativeTools:
         if allowed and thread not in allowed:
             raise ValueError(f"会话 {thread} 不在撤回白名单内，已拒绝撤回")
         if record.get("recall") is not None:
-            return {"success": True, "status": "already_recalled", "message_id": target}
+            return {
+                "success": True,
+                "status": "already_recalled",
+                "message_id": target,
+                "content": "这条消息此前已经撤回过了，无需重复操作。",
+            }
         server_id = str(record.get("serverId") or "")
         if not server_id.isdigit():
             raise ValueError("目标消息缺少可撤回的服务端 ID，可能已过期")
@@ -225,6 +230,7 @@ class WechatNativeTools:
             "status": status,
             "message_id": target,
             "detail": detail,
+            "content": "已撤回这条消息。" if status == "recalled" else "这条消息此前已经撤回过了。",
         }
 
     async def _await_operation(
@@ -383,7 +389,12 @@ class WechatNativeTools:
         operation = await client.set_my_group_name(thread, name, secrets.token_hex(16))
         # 受理不等于生效，必须等到 Native 明确返回成功。
         await self._await_operation(client, operation, label="修改群昵称")
-        return {"success": True, "group_id": thread, "nickname": name}
+        return {
+            "success": True,
+            "group_id": thread,
+            "nickname": name,
+            "content": f"已把自己的群昵称改为「{name}」。",
+        }
 
     async def rename_group(self, thread: str, name: str) -> Dict[str, Any]:
         """修改群名称。
@@ -401,7 +412,12 @@ class WechatNativeTools:
         client = self._admin_client()
         operation = await client.rename_group(thread, group_name, secrets.token_hex(16))
         await self._await_operation(client, operation, label="修改群名")
-        return {"success": True, "group_id": thread, "name": group_name}
+        return {
+            "success": True,
+            "group_id": thread,
+            "name": group_name,
+            "content": f"已把群名改为「{group_name}」。",
+        }
 
     async def get_group_info(self, thread: str) -> Dict[str, Any]:
         """读取群资料。
@@ -420,7 +436,7 @@ class WechatNativeTools:
             # Native 没同步群名时 displayName 就是 chatroom ID，
             # 不能拿它冒充群名：改用与入站消息一致的成员拼名。
             result["name"] = await self._plugin._group_name(self._client(), thread)
-        return result
+        return {"success": True, "content": _summary_group(result), **result}
 
     async def list_group_members(
         self, thread: str, limit: Any = 50, search: str = ""
@@ -440,7 +456,8 @@ class WechatNativeTools:
         raw = await self._client().group_members(
             thread, limit=clamp_limit(limit, default=50, maximum=200), search=str(search or "").strip()
         )
-        return _project_members(raw)
+        result = _project_members(raw)
+        return {"success": True, "content": _summary_members(result), **result}
 
     async def search_history(
         self, thread: str, query: str = "", limit: Any = 20
@@ -465,7 +482,7 @@ class WechatNativeTools:
         )
         result = _project_messages(raw)
         await self._fill_sender_names(client, normalized, result["messages"])
-        return result
+        return {"success": True, "content": _summary_messages(result), **result}
 
     async def _fill_sender_names(
         self, client: NativeClient, thread: str, messages: List[Dict[str, Any]]
@@ -533,7 +550,8 @@ class WechatNativeTools:
         keyword = clean_text(query, label="搜索关键词", maximum=128)
         # Native 没有独立的搜索接口，用联系人列表的 query 参数过滤。
         raw = await self._client().contacts(limit=CONTACT_SEARCH_LIMIT, query=keyword)
-        return _project_contacts(raw)
+        result = _project_contacts(raw)
+        return {"success": True, "content": _summary_contacts(result), **result}
 
     async def list_contact_requests(self, search: str = "") -> Dict[str, Any]:
         """列出来自他人的好友申请。
@@ -548,7 +566,8 @@ class WechatNativeTools:
         native = self._config
         if not native.enable_friend_requests:
             raise ToolUnavailable("好友申请处理未开启")
-        return await self._admin_client().contact_requests(search=str(search or "").strip())
+        raw = await self._admin_client().contact_requests(search=str(search or "").strip())
+        return {"success": True, "content": _summary_contact_requests(raw), "requests": raw.get("items") or []}
 
     async def accept_contact_request(self, request_id: str) -> Dict[str, Any]:
         """接受一条好友申请。
@@ -573,7 +592,12 @@ class WechatNativeTools:
             raise ValueError("该好友申请缺少版本信息，无法接受")
         operation = await admin.accept_contact_request(identifier, version, secrets.token_hex(16))
         await self._await_operation(admin, operation, label="接受好友申请")
-        return {"success": True, "status": "accepted", "request_id": identifier}
+        return {
+            "success": True,
+            "status": "accepted",
+            "request_id": identifier,
+            "content": "已接受这条好友申请。",
+        }
 
 
 def _project_contacts(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -720,13 +744,158 @@ def _project_messages(raw: Dict[str, Any]) -> Dict[str, Any]:
                 "direction": str(item.get("direction") or ""),
                 "timestamp": str(item.get("createdAt") or ""),
                 "type": message_type_name(item.get("type")),
-                "text": body,            }
+                "text": body,
+            }
         )
     result: Dict[str, Any] = {"messages": messages}
     next_cursor = str(raw.get("nextCursor") or "")
     if next_cursor:
         result["next_cursor"] = next_cursor
     return result
+
+
+def _clean_announcement(text: str) -> str:
+    """清理群公告里的图片占位符与重复行。
+
+    微信公告常把图片渲染成 ``[图片]``，同一条公告还会重复出现，
+    原样交给模型只会浪费上下文。
+
+    Args:
+        text: 原始群公告。
+
+    Returns:
+        str: 清理后的公告；全部是占位符时返回空字符串。
+    """
+
+    seen: List[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped in {"[图片]", "[视频]", "[语音]", "[表情]"}:
+            continue
+        if stripped not in seen:
+            seen.append(stripped)
+    return "\n".join(seen)
+
+
+def _summary_group(info: Dict[str, Any]) -> str:
+    """把群资料整理成模型可读的一段文字。
+
+    Args:
+        info: ``_project_group`` 的返回值。
+
+    Returns:
+        str: 群资料摘要。
+    """
+
+    name = str(info.get("name") or "").strip()
+    lines = [f"群名称：{name}" if name else "群名称：未同步（微信侧尚未下发群名）"]
+    if owner := str(info.get("owner_id") or "").strip():
+        lines.append(f"群主：{owner}")
+    if announcement := _clean_announcement(str(info.get("announcement") or "")):
+        lines.append(f"群公告：{announcement}")
+    if mine := str(info.get("my_display_name") or "").strip():
+        lines.append(f"我在本群的昵称：{mine}")
+    admins = info.get("administrator_count")
+    if isinstance(admins, int) and admins > 0:
+        lines.append(f"管理员数量：{admins}")
+    return "\n".join(lines)
+
+
+def _summary_members(result: Dict[str, Any]) -> str:
+    """把群成员列表整理成模型可读的一段文字。
+
+    Args:
+        result: ``_project_members`` 的返回值。
+
+    Returns:
+        str: 成员列表摘要。
+    """
+
+    members = result.get("members") or []
+    if not members:
+        return "没有匹配的群成员。"
+    lines = [f"共 {len(members)} 位成员："]
+    for index, member in enumerate(members, start=1):
+        name = str(member.get("display_name") or "").strip() or "（无昵称）"
+        contact = str(member.get("contact_name") or "").strip()
+        suffix = f"（备注：{contact}）" if contact else ""
+        lines.append(f"{index}. {name}{suffix} — {member.get('user_id') or ''}")
+    return "\n".join(lines)
+
+
+def _summary_messages(result: Dict[str, Any]) -> str:
+    """把历史消息整理成模型可读的一段文字。
+
+    Args:
+        result: ``_project_messages`` 的返回值。
+
+    Returns:
+        str: 历史消息摘要。
+    """
+
+    messages = result.get("messages") or []
+    if not messages:
+        return "当前会话没有匹配的历史消息。"
+    lines = [f"共 {len(messages)} 条消息（按时间倒序）："]
+    for message in messages:
+        who = str(message.get("sender_name") or "").strip() or str(message.get("sender_id") or "未知")
+        if message.get("direction") == "outgoing":
+            who = "我"
+        kind = str(message.get("type") or "text")
+        text = str(message.get("text") or "").strip() or f"[{kind}]"
+        lines.append(f"- {message.get('timestamp') or ''} {who}：{text}")
+    return "\n".join(lines)
+
+
+def _summary_contacts(result: Dict[str, Any]) -> str:
+    """把联系人列表整理成模型可读的一段文字。
+
+    Args:
+        result: ``_project_contacts`` 的返回值。
+
+    Returns:
+        str: 联系人摘要。
+    """
+
+    contacts = result.get("contacts") or []
+    if not contacts:
+        return "没有匹配的联系人。"
+    lines = [f"共 {len(contacts)} 位联系人："]
+    for contact in contacts:
+        name = str(contact.get("display_name") or "").strip() or "（无昵称）"
+        remark = str(contact.get("remark") or "").strip()
+        suffix = f"（备注：{remark}）" if remark else ""
+        lines.append(f"- {name}{suffix} — {contact.get('user_id') or ''}")
+    return "\n".join(lines)
+
+
+def _summary_contact_requests(raw: Dict[str, Any]) -> str:
+    """把好友申请列表整理成模型可读的一段文字。
+
+    Args:
+        raw: Native ``/contact-requests`` 的原始响应。
+
+    Returns:
+        str: 好友申请摘要。
+    """
+
+    items = raw.get("items") if isinstance(raw.get("items"), list) else []
+    if not items:
+        return "当前没有待处理的好友申请。"
+    lines = [f"共 {len(items)} 条待处理好友申请："]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = (
+            str(item.get("displayName") or "").strip()
+            or str(item.get("nickname") or "").strip()
+            or str(item.get("senderId") or "").strip()
+            or "未知"
+        )
+        greeting = str(item.get("message") or item.get("greeting") or "").strip()
+        suffix = f"：{greeting}" if greeting else ""
+        lines.append(f"- {name}{suffix} — 申请 ID：{item.get('id') or ''}")
+    return "\n".join(lines)
 
 
 def describe_error(error: Exception) -> Dict[str, Any]:
@@ -741,11 +910,13 @@ def describe_error(error: Exception) -> Dict[str, Any]:
 
     if isinstance(error, NativeAPIError):
         logger.warning("微信工具调用失败: HTTP %s (%s)", error.status, error.code)
-        return {"success": False, "error": f"微信接口返回错误（HTTP {error.status}，{error.code or 'unknown'}）"}
+        message = f"微信接口返回错误（HTTP {error.status}，{error.code or 'unknown'}）"
+        return {"success": False, "error": message, "content": message}
     if isinstance(error, (ToolUnavailable, ValueError)):
-        return {"success": False, "error": str(error)}
+        return {"success": False, "error": str(error), "content": str(error)}
     logger.error("微信工具调用异常: %s", error, exc_info=True)
-    return {"success": False, "error": "微信工具调用失败，请查看日志"}
+    message = "微信工具调用失败，请查看日志"
+    return {"success": False, "error": message, "content": message}
 
 
 def tool_names(config: Optional[NativeConfig]) -> List[str]:

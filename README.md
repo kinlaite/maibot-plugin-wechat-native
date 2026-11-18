@@ -16,6 +16,9 @@
 
 1. 运行并登录 `agent-wechat-native`，确认 `/v1/accounts` 能返回账号。
 2. 准备一个对该账号有权限的 Token。
+3. 麦麦 1.4.x + 插件 SDK 2.23.0 及以上。Python 依赖（`aiohttp`、`pypdf`、`pillow`、`msgpack`）已在 `_manifest.json` 声明，
+   由麦麦在加载时自动安装；如果所在环境关闭了自动安装，可手动执行
+   `pip install -r requirements.txt`。
 
 ## 配置
 
@@ -96,19 +99,13 @@
 
 两个条件必须同时满足才会执行：配置里有可用的 **admin Token**，且发起者 `senderId` 在**管理员白名单**里。任一条件不满足，这些工具不仅不会执行，还不会出现在模型的可用工具列表中。
 
+所有工具都返回 `{"success": ..., "content": "..."}`：`content` 是给模型直接阅读的中文摘要，
+其余结构化字段（`group_id`、`members`、`messages` 等）保留给需要精确取值的调用方。
+失败时 `success` 为 `false`，`content` 与 `error` 都是可直接展示的原因。
+
 ### 微信没有的能力
 
 微信个人号接口不支持**禁言**和**移出群成员**，所以这里没有对应工具。模型被告知了这一限制，不会假装能执行。
-
-## 权限与 Token
-
-| 功能 | 所需 scope |
-| --- | --- |
-| 收发消息、读取历史、群资料、群成员、搜索联系人 | `read`、`send`、`media` |
-| 扫码登录、连接与断开 | `login` |
-| 撤回、改群昵称、改群名、好友申请 | `admin` |
-
-日常连接用普通 Token（`Native Token`），管理工具另外配置 `admin Token`。不配置 admin Token 时插件仍可正常收发消息，只是管理工具保持关闭。
 
 ## 支持的消息
 

@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "neozhu.wechat-native-adapter",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "name": "微信 Native 适配器",
   "display": {
     "icon": {
@@ -10,26 +10,23 @@
       "fallback": "message-circle"
     }
   },
-  "description": "通过 agent-wechat-native /v1 API 把个人微信接入麦麦，支持私聊与群聊的文本、图片、语音和引用回复。移植自 AstrBot 插件 astrbot-plugin-wechat-native。",
+  "description": "通过 agent-wechat-native /v1 API 把个人微信接入麦麦，支持私聊与群聊的文本、图片、语音和引用回复。移植自 AstrBot 插件 astrbot-plugin-wechat-native（作者 neozhu，MIT）。",
   "author": {
     "name": "neozhu",
     "url": "https://github.com/neozhu"
   },
   "urls": {
-    "repository": "https://github.com/neozhu/astrbot-plugin-wechat-native",
-    "homepage": "https://github.com/neozhu/astrbot-plugin-wechat-native",
-    "documentation": "https://github.com/neozhu/astrbot-plugin-wechat-native#readme",
-    "issues": "https://github.com/neozhu/astrbot-plugin-wechat-native/issues"
+    "repository": "https://github.com/neozhu/astrbot-plugin-wechat-native"
   },
   "license": "MIT",
   "plugin_type": "adapter",
   "host_application": {
     "min_version": "1.4.0",
-    "max_version": "1.99.99"
+    "max_version": "1.4.99"
   },
   "sdk": {
-    "min_version": "2.21.0",
-    "max_version": "2.99.99"
+    "min_version": "2.23.0",
+    "max_version": "2.23.99"
   },
   "dependencies": [
     {"type": "python_package", "name": "aiohttp", "version_spec": ">=3.11.18,<4"},

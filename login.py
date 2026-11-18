@@ -56,11 +56,12 @@ class LoginSession:
         return self.task is not None and not self.task.done()
 
 
-async def start_login(client: NativeClient) -> LoginSession:
+async def start_login(client: NativeClient, session: Optional[LoginSession] = None) -> LoginSession:
     """发起一次扫码登录并取回首张二维码。
 
     Args:
         client: 已连接且具备登录权限的 Native 客户端。
+        session: 调用方预先创建并已暴露给配置页的会话；省略时新建一个。
 
     Returns:
         LoginSession: 已填入二维码的会话。
@@ -70,7 +71,8 @@ async def start_login(client: NativeClient) -> LoginSession:
         ValueError: 返回的二维码格式不符合预期。
     """
 
-    session = LoginSession()
+    if session is None:
+        session = LoginSession()
     session.idempotency_key = secrets.token_hex(16)
     operation = await client.start_login(session.idempotency_key, force_qr=True)
     session.operation_id = str(operation.get("id") or "")

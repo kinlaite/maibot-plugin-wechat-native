@@ -211,7 +211,11 @@ class WeChatNativePlugin(MaiBotPlugin):
         )
 
     async def _handle_start_login(self) -> None:
-        """发起扫码登录并开始轮询状态。"""
+        """发起扫码登录并开始轮询状态。
+
+        配置错误同步抛出，直接显示在配置页上；申请二维码要访问 Native，
+        属于网络 I/O，放进后台任务立即返回，避免超过配置页的 8 秒限制。
+        """
 
         if not self._login_client_ready():
             raise ValueError("请先填写 Native 服务地址与 Account ID，再生成二维码")
@@ -223,31 +227,44 @@ class WeChatNativePlugin(MaiBotPlugin):
             token = native.load_token()
         except ValueError as error:
             raise ValueError(f"登录配置无效：{error}") from error
-        client = NativeClient(native.api_url, native.account_id, token)
-        await client.open()
-        try:
-            session = await start_login(client)
-        except NativeAPIError as error:
-            await client.close()
-            if error.status == 409 and error.code == "operation_in_progress":
-                raise ValueError(
-                    "该微信账号已有正在进行的登录操作；若账号已在线则无需扫码，"
-                    "如需重新登录请先在 Native 侧断开该账号"
-                ) from error
-            raise ValueError(f"Native 拒绝发起登录（HTTP {error.status}，{error.code or 'unknown'}）") from error
-        except Exception:
-            await client.close()
-            raise
+
         old = self._login
         if old.task is not None and not old.task.done():
             old.task.cancel()
+            with suppress(asyncio.CancelledError):
+                await old.task
+
+        session = LoginSession()
+        session.message = "正在向 Native 申请二维码…"
+        session.tone = "neutral"
         self._login = session
 
         async def run() -> None:
+            client = NativeClient(native.api_url, native.account_id, token)
             try:
+                await client.open()
+                try:
+                    await start_login(client, session)
+                except NativeAPIError as error:
+                    if error.status == 409 and error.code == "operation_in_progress":
+                        session.message = (
+                            "该微信账号已有正在进行的登录操作；若账号已在线则无需扫码，"
+                            "如需重新登录请先在 Native 侧断开该账号"
+                        )
+                    else:
+                        session.message = f"Native 拒绝发起登录（HTTP {error.status}，{error.code or 'unknown'}）"
+                    session.tone = "error"
+                    return
+                except Exception as error:  # noqa: BLE001 - 后台任务异常必须落到页面状态
+                    logger.error("发起微信扫码登录失败: %s", error, exc_info=True)
+                    session.message = "发起扫码登录失败，请查看日志"
+                    session.tone = "error"
+                    return
                 await poll_login(client, session)
             finally:
-                await client.close()
+                # 客户端由本次登录任务独占，任何退出路径都要释放。
+                with suppress(Exception):
+                    await client.close()
 
         session.task = asyncio.create_task(run(), name="wechat-native-login")
 
