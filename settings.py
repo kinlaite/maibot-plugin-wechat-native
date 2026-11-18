@@ -13,7 +13,7 @@ class PluginSection(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="启用微信连接；启用后等待 Native 账号在线")
-    config_version: str = Field(default="1.0.0", description="配置版本")
+    config_version: str = Field(default="1.1.0", description="配置版本")
 
 
 class NativeSection(PluginConfigBase):

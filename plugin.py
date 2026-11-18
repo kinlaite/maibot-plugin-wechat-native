@@ -77,6 +77,7 @@ class WeChatNativePlugin(MaiBotPlugin):
         ConfigWidget(id="account", kind="status", label="微信账号"),
         ConfigWidget(id="qrcode", kind="qrcode", label="微信扫码登录"),
         ConfigWidget(id="start_login", kind="action", label="生成登录二维码"),
+        ConfigWidget(id="cancel_login", kind="action", label="取消扫码"),
         ConfigWidget(id="reconnect", kind="action", label="重新连接"),
     ]
 
@@ -181,6 +182,7 @@ class WeChatNativePlugin(MaiBotPlugin):
             else "请先填写 Native 服务地址与 Account ID"
         )
         login = self._login
+        running = login.running()
         qr_state = ConfigWidgetState(
             text=login.message,
             tone=login.tone,
@@ -192,9 +194,9 @@ class WeChatNativePlugin(MaiBotPlugin):
             "account": ConfigWidgetState(text=self._self_id or "尚未识别微信账号"),
             "qrcode": qr_state,
             "start_login": ConfigWidgetState(
-                text="" if login.running() else "",
-                disabled=login.running() or not self._login_client_ready(),
+                text="", disabled=running or not self._login_client_ready()
             ),
+            "cancel_login": ConfigWidgetState(text="", visible=running),
             "reconnect": ConfigWidgetState(disabled=not configured),
         }
 
@@ -250,6 +252,24 @@ class WeChatNativePlugin(MaiBotPlugin):
 
         session.task = asyncio.create_task(run(), name="wechat-native-login")
 
+    async def _handle_cancel_login(self) -> None:
+        """取消正在进行的扫码登录。
+
+        不取消的话，扫错码或想换号时只能等 10 分钟超时，
+        期间 Native 侧还占着一条登录操作，无法重新发起。
+        """
+
+        session = self._login
+        task = session.task
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        session.task = None
+        session.reset()
+        session.message = "已取消扫码登录"
+        session.tone = "neutral"
+
     async def on_config_widget_action(self, action_id: str) -> None:
         """处理配置页操作按钮。
 
@@ -262,6 +282,9 @@ class WeChatNativePlugin(MaiBotPlugin):
 
         if action_id == "start_login":
             await self._handle_start_login()
+            return
+        if action_id == "cancel_login":
+            await self._handle_cancel_login()
             return
         if action_id != "reconnect":
             raise ValueError(f"未知配置页操作: {action_id}")
@@ -1495,6 +1518,17 @@ class WeChatNativePlugin(MaiBotPlugin):
             ).strip()
         if not thread:
             return ""
+        # 宿主出站时会把触发本次回复的消息 ID 写进 reply_to。
+        # 群聊里多人同时说话时，只按会话取「最新一条」会引用错消息，
+        # 因此能拿到 reply_to 就精确定位。
+        reply_to = str(message.get("reply_to") or "").strip()
+        if reply_to:
+            for key in reversed(list(self._pending_source)):
+                source = self._pending_source[key]
+                if source["threadId"] != thread:
+                    continue
+                if key == reply_to or source.get("messageId") == reply_to:
+                    return key
         for key in reversed(list(self._pending_source)):
             if self._pending_source[key]["threadId"] == thread:
                 return key
