@@ -80,6 +80,66 @@ class ChatSection(PluginConfigBase):
             "hint": "mention：仅明确 @机器人时接入；all：所有群消息都接入并交给麦麦主动回复策略；disabled：关闭群聊"
         },
     )
+    group_reply_style: Literal["quote", "mention", "plain"] = Field(
+        default="quote",
+        description="群聊回复方式",
+        json_schema_extra={
+            "hint": "quote：引用触发消息；mention：@触发者；plain：直接发送。仅对首条文字回复生效，私聊不处理"
+        },
+    )
+
+
+class ToolSection(PluginConfigBase):
+    """只读工具开关。"""
+
+    __ui_label__ = "只读工具"
+    __ui_icon__ = "wrench"
+    __ui_order__ = 4
+
+    enable_history_tools: bool = Field(
+        default=False,
+        description="启用历史消息、群资料与群成员查询",
+        json_schema_extra={"hint": "只读取当前聊天，不跨会话；需要 Token 具备 read 权限"},
+    )
+    enable_contact_search: bool = Field(
+        default=False,
+        description="启用联系人搜索",
+        json_schema_extra={"hint": "只搜索并返回匹配结果，不会发送好友申请"},
+    )
+
+
+class ActionSection(PluginConfigBase):
+    """写操作工具开关，均需要 admin Token。"""
+
+    __ui_label__ = "管理工具"
+    __ui_icon__ = "shield"
+    __ui_order__ = 5
+
+    admin_token: str = Field(
+        default="",
+        description="Native admin Token",
+        json_schema_extra={"hint": "留空时读取 admin_token_file；不配置则所有写操作工具保持关闭", "hidden": True},
+    )
+    admin_token_file: str = Field(
+        default="",
+        description="Native admin Token 文件路径",
+        json_schema_extra={"hint": "优先于 admin_token；须具备目标账号的 admin scope"},
+    )
+    enable_wechat_actions: bool = Field(
+        default=False,
+        description="启用撤回与群名修改工具",
+        json_schema_extra={"hint": "仅对 admin 白名单内的发送者生效"},
+    )
+    wechat_action_admins: List[str] = Field(
+        default_factory=list,
+        description="可执行写操作的 senderId 白名单",
+        json_schema_extra={"hint": "填写真实 senderId（例如 wxid_xxx），不是昵称；留空时任何人都不能使用写操作工具"},
+    )
+    enable_friend_requests: bool = Field(
+        default=False,
+        description="启用好友申请处理",
+        json_schema_extra={"hint": "查看并处理好友申请需要 admin Token"},
+    )
 
 
 class MediaSection(PluginConfigBase):
@@ -101,3 +161,5 @@ class Settings(PluginConfigBase):
     native: NativeSection = Field(default_factory=NativeSection)
     chat: ChatSection = Field(default_factory=ChatSection)
     media: MediaSection = Field(default_factory=MediaSection)
+    tools: ToolSection = Field(default_factory=ToolSection)
+    actions: ActionSection = Field(default_factory=ActionSection)

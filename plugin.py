@@ -3,7 +3,15 @@
 from contextlib import suppress
 from typing import Any, ClassVar, Dict, List, Optional, Type
 
-from maibot_sdk import ConfigWidget, ConfigWidgetState, MaiBotPlugin, MessageGateway, PluginConfigBase
+from maibot_sdk import (
+    ConfigWidget,
+    ConfigWidgetState,
+    MaiBotPlugin,
+    MessageGateway,
+    PluginConfigBase,
+    Tool,
+)
+from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
 import asyncio
 import secrets
@@ -30,9 +38,21 @@ from .native_client import (
 )
 from .settings import Settings
 from .state import StateIdentityError, StateStore, cursor_number
+from .tools import ToolUnavailable, WechatNativeTools, describe_error, tool_names
 
 GATEWAY_NAME = "wechat_native_gateway"
 MEDIA_RETRY_SECONDS = 3
+ALL_TOOL_NAMES = (
+    "wechat_search_history",
+    "wechat_group_info",
+    "wechat_group_members",
+    "wechat_search_contact",
+    "wechat_recall_message",
+    "wechat_set_my_group_nickname",
+    "wechat_rename_group",
+    "wechat_list_friend_requests",
+    "wechat_accept_friend_request",
+)
 
 
 class WeChatNativePlugin(MaiBotPlugin):
@@ -60,13 +80,39 @@ class WeChatNativePlugin(MaiBotPlugin):
         self._ready = False
         self._status = "尚未连接"
         self._stopping = False
-
+        self._pending_source: Dict[str, Dict[str, str]] = {}
+        self._admin_client: Optional[NativeClient] = None
+        self._tools = WechatNativeTools(self)
     async def on_load(self) -> None:
         """初始化持久化状态并按配置启动接收任务。"""
 
         self._store = StateStore(self.ctx.paths.data_dir / "wechat-native.sqlite3")
         if self.config.plugin.enabled:
             self._start()
+        await self._sync_tool_visibility()
+
+    async def _sync_tool_visibility(self) -> None:
+        """按配置启用或禁用面向模型的工具。
+
+        工具开关只影响是否出现在模型可用列表里，实际执行时仍会再校验一次权限。
+        """
+
+        native: Optional[NativeConfig] = None
+        try:
+            native = NativeConfig.from_settings(
+                self.config.native, self.config.chat, self.config.media, self.config.tools, self.config.actions
+            )
+        except ValueError:
+            logger.info("WeChat Native 配置不完整，工具保持关闭")
+        enabled = set(tool_names(native))
+        for name in ALL_TOOL_NAMES:
+            try:
+                if name in enabled:
+                    await self.ctx.component.enable_component(name, "tool")
+                else:
+                    await self.ctx.component.disable_component(name, "tool")
+            except Exception as error:
+                logger.warning("调整微信工具可见性失败: tool=%s error=%s", name, error)
 
     async def on_unload(self) -> None:
         """停止后台任务并释放连接。"""
@@ -91,6 +137,7 @@ class WeChatNativePlugin(MaiBotPlugin):
             self.set_plugin_config(config_data)
             if self.config.plugin.enabled:
                 self._start()
+            await self._sync_tool_visibility()
 
     async def get_config_widget_state(self) -> Dict[str, ConfigWidgetState]:
         """返回插件管理页展示的连接状态。
@@ -150,13 +197,18 @@ class WeChatNativePlugin(MaiBotPlugin):
         """校验配置并启动接收任务。"""
 
         try:
-            native = NativeConfig.from_settings(self.config.native, self.config.chat, self.config.media)
+            native = NativeConfig.from_settings(
+                self.config.native, self.config.chat, self.config.media, self.config.tools, self.config.actions
+            )
             native.load_token()
+            admin_token = native.load_admin_token()
         except ValueError as error:
             self._status = f"配置无效：{error}"
             logger.error("WeChat Native 配置无效: %s", error)
             return
         self._native = native
+        if admin_token:
+            self._admin_client = NativeClient(native.api_url, native.account_id, admin_token)
         self._stopping = False
         self._status = "等待连接 Native"
         self._worker = asyncio.create_task(self._run(), name="wechat-native-adapter")
@@ -176,6 +228,12 @@ class WeChatNativePlugin(MaiBotPlugin):
         if client is not None:
             with suppress(Exception):
                 await client.close()
+        admin = self._admin_client
+        self._admin_client = None
+        if admin is not None:
+            if not admin.closed:
+                with suppress(Exception):
+                    await admin.close()
         self._ready = False
 
     async def _set_ready(self, ready: bool, status: str = "") -> None:
@@ -214,6 +272,8 @@ class WeChatNativePlugin(MaiBotPlugin):
             client = NativeClient(native.api_url, native.account_id, native.load_token())
             self._client = client
             await client.open()
+            if self._admin_client is not None:
+                await self._admin_client.open()
             while not self._stopping:
                 try:
                     account = await client.account()
@@ -252,6 +312,10 @@ class WeChatNativePlugin(MaiBotPlugin):
             self._client = None
             with suppress(Exception):
                 await client.close()
+            admin = self._admin_client
+            if admin is not None and not admin.closed:
+                with suppress(Exception):
+                    await admin.close()
 
     async def _process_event(self, event: Dict[str, Any], store: StateStore) -> None:
         """处理单条 Native 事件并推进游标。
@@ -373,6 +437,12 @@ class WeChatNativePlugin(MaiBotPlugin):
             # 同一条消息 ID 被复用于不同会话时，保留证据并要求人工检查，而不覆盖旧记录。
             logger.error("微信消息身份冲突，已保留原记录: %s (%s)", external_id, error)
             return
+        self._pending_source[external_id] = {
+            "threadId": thread,
+            "senderId": sender,
+            "messageId": str(raw["id"]),
+            "serverId": str(raw.get("serverId") or ""),
+        }
         accepted = await self.ctx.gateway.route_message(
             GATEWAY_NAME,
             message,
@@ -440,6 +510,237 @@ class WeChatNativePlugin(MaiBotPlugin):
                 logger.info("微信媒体读取失败: message=%s kind=%s error=%s", raw.get("id"), kind, error)
         return images, voice, pdf_name, pdf_text
 
+    @Tool(
+        "wechat_search_history",
+        platforms=PLATFORM,
+        visibility="visible",
+        description=(
+            "仅用于微信：搜索当前微信会话的历史消息。只能读取当前会话，不能跨聊天或跨群查询。"
+            "留空 query 返回最近的若干条消息。返回内容可能不完整，较早的消息可能已被清理。"
+        ),
+        parameters=[
+            ToolParameterInfo(name="query", param_type=ToolParamType.STRING, description="搜索关键词，留空表示最近消息"),
+            ToolParameterInfo(name="limit", param_type=ToolParamType.INTEGER, description="返回条数，1-50，默认 20"),
+        ],
+    )
+    async def tool_search_history(self, **kwargs: Any) -> Dict[str, Any]:
+        """在工具调用中搜索当前微信会话的历史消息。"""
+
+        try:
+            stream = await self._tool_stream(kwargs)
+            return await self._tools.search_history(stream["thread"], kwargs.get("query", ""), kwargs.get("limit", 20))
+        except Exception as error:
+            return describe_error(error)
+
+    @Tool(
+        "wechat_group_info",
+        platforms=PLATFORM,
+        visibility="visible",
+        description=(
+            "仅用于微信：读取当前微信群的资料，包括群名等公开信息。仅群聊可用，读取当前群而非任意群。"
+        ),
+    )
+    async def tool_group_info(self, **kwargs: Any) -> Dict[str, Any]:
+        """在工具调用中读取当前微信群资料。"""
+
+        try:
+            stream = await self._tool_stream(kwargs)
+            return await self._tools.get_group_info(stream["thread"])
+        except Exception as error:
+            return describe_error(error)
+
+    @Tool(
+        "wechat_group_members",
+        platforms=PLATFORM,
+        visibility="visible",
+        description=(
+            "仅用于微信：列出或按昵称搜索当前微信群的成员。仅群聊可用，"
+            "只能查询当前群，不能查询其他群或好友列表。"
+        ),
+        parameters=[
+            ToolParameterInfo(name="search", param_type=ToolParamType.STRING, description="成员昵称关键词，留空表示列出成员"),
+            ToolParameterInfo(name="limit", param_type=ToolParamType.INTEGER, description="返回条数，1-200，默认 50"),
+        ],
+    )
+    async def tool_group_members(self, **kwargs: Any) -> Dict[str, Any]:
+        """在工具调用中列出或搜索当前群成员。"""
+
+        try:
+            stream = await self._tool_stream(kwargs)
+            return await self._tools.list_group_members(
+                stream["thread"], kwargs.get("limit", 50), kwargs.get("search", "")
+            )
+        except Exception as error:
+            return describe_error(error)
+
+    @Tool(
+        "wechat_search_contact",
+        platforms=PLATFORM,
+        visibility="visible",
+        description=(
+            "仅用于微信：按昵称或备注搜索微信联系人。只返回匹配结果，不会添加好友；"
+            "添加好友需要对方先发起好友申请。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="query", param_type=ToolParamType.STRING, description="昵称或备注关键词", required=True
+            )
+        ],
+    )
+    async def tool_search_contact(self, **kwargs: Any) -> Dict[str, Any]:
+        """在工具调用中搜索微信联系人。"""
+
+        try:
+            return await self._tools.search_contact(kwargs.get("query", ""))
+        except Exception as error:
+            return describe_error(error)
+
+    @Tool(
+        "wechat_recall_message",
+        platforms=PLATFORM,
+        visibility="visible",
+        description=(
+            "仅用于微信：撤回机器人自己发送的一条消息。只能撤回机器人自己的消息，"
+            "不能撤回他人消息。不传 msg_id 时撤回本会话中机器人最近发送的一条。"
+            "注意微信没有禁言或踢人能力。"
+        ),
+        parameters=[
+            ToolParameterInfo(name="msg_id", param_type=ToolParamType.STRING, description="目标消息 ID，留空表示最近一条"),
+        ],
+    )
+    async def tool_recall_message(self, **kwargs: Any) -> Dict[str, Any]:
+        """在工具调用中撤回机器人自己发送的消息。"""
+
+        try:
+            stream = await self._tool_stream(kwargs, require_group=True, admin=True)
+            return await self._tools.recall_message(stream["thread"], kwargs.get("msg_id", ""))
+        except Exception as error:
+            return describe_error(error)
+
+    @Tool(
+        "wechat_set_my_group_nickname",
+        platforms=PLATFORM,
+        visibility="visible",
+        description=(
+            "仅用于微信：修改机器人在当前群里的群昵称。只影响机器人自己的群昵称，"
+            "不能修改他人昵称，也不能用于私聊。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="nickname", param_type=ToolParamType.STRING, description="新的群昵称", required=True
+            )
+        ],
+    )
+    async def tool_set_my_group_nickname(self, **kwargs: Any) -> Dict[str, Any]:
+        """在工具调用中修改机器人的群昵称。"""
+
+        try:
+            stream = await self._tool_stream(kwargs, require_group=True, admin=True)
+            return await self._tools.set_my_group_nickname(stream["thread"], kwargs.get("nickname", ""))
+        except Exception as error:
+            return describe_error(error)
+
+    @Tool(
+        "wechat_rename_group",
+        platforms=PLATFORM,
+        visibility="visible",
+        description=(
+            "仅用于微信：修改当前微信群的群名称。会影响群内所有成员，属于高影响操作，"
+            "仅在用户明确要求改群名时调用。不能用于私聊或其他群。"
+        ),
+        parameters=[
+            ToolParameterInfo(name="name", param_type=ToolParamType.STRING, description="新的群名称", required=True)
+        ],
+    )
+    async def tool_rename_group(self, **kwargs: Any) -> Dict[str, Any]:
+        """在工具调用中修改当前群名称。"""
+
+        try:
+            stream = await self._tool_stream(kwargs, require_group=True, admin=True)
+            return await self._tools.rename_group(stream["thread"], kwargs.get("name", ""))
+        except Exception as error:
+            return describe_error(error)
+
+    @Tool(
+        "wechat_list_friend_requests",
+        platforms=PLATFORM,
+        visibility="visible",
+        description=(
+            "仅用于微信：列出他人发给机器人的好友申请。只读取申请列表，不会自动通过；"
+            "是否接受需要用单独的工具并经过用户确认。"
+        ),
+        parameters=[
+            ToolParameterInfo(name="search", param_type=ToolParamType.STRING, description="申请人关键词，可选"),
+        ],
+    )
+    async def tool_list_friend_requests(self, **kwargs: Any) -> Dict[str, Any]:
+        """在工具调用中列出好友申请。"""
+
+        try:
+            await self._tool_stream(kwargs, admin=True)
+            return await self._tools.list_contact_requests(kwargs.get("search", ""))
+        except Exception as error:
+            return describe_error(error)
+
+    @Tool(
+        "wechat_accept_friend_request",
+        platforms=PLATFORM,
+        visibility="visible",
+        description=(
+            "仅用于微信：接受一条好友申请。微信没有拒绝申请的接口，不接受时不要调用本工具。"
+            "该操作会建立好友关系，仅在用户明确同意后调用。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="request_id", param_type=ToolParamType.STRING, description="好友申请 ID", required=True
+            )
+        ],
+    )
+    async def tool_accept_friend_request(self, **kwargs: Any) -> Dict[str, Any]:
+        """在工具调用中接受一条好友申请。"""
+
+        try:
+            await self._tool_stream(kwargs, admin=True)
+            return await self._tools.accept_contact_request(kwargs.get("request_id", ""))
+        except Exception as error:
+            return describe_error(error)
+
+    async def _tool_stream(
+        self, kwargs: Dict[str, Any], *, require_group: bool = False, admin: bool = False
+    ) -> Dict[str, str]:
+        """解析当前工具调用所属的微信会话并校验权限。
+
+        Args:
+            kwargs: 宿主传入的工具参数，含当前聊天上下文。
+            require_group: 是否要求当前会话是群聊。
+            admin: 是否要求发起者在管理员白名单内。
+
+        Returns:
+            Dict[str, str]: 会话信息，至少包含 ``thread`` 与 ``sender``。
+
+        Raises:
+            ValueError: 当前会话不属于微信或不是群聊。
+        """
+
+        native = self._native
+        if native is None:
+            raise ToolUnavailable("微信适配器尚未完成初始化")
+        if kwargs.get("platform") and kwargs["platform"] != PLATFORM:
+            raise ValueError("该工具仅适用于微信会话")
+        thread = str(kwargs.get("group_id") or kwargs.get("target_id") or "").strip()
+        sender = str(kwargs.get("user_id") or "").strip()
+        if not thread:
+            thread = str(
+                (kwargs.get("message_info") or {}).get("additional_config", {}).get("wechat_thread_id") or ""
+            ).strip()
+        if require_group and thread and not is_group_thread(thread):
+            raise ValueError("该工具仅支持微信群聊")
+        if require_group and not thread:
+            raise ValueError("无法从当前会话确定微信群 ID")
+        if admin:
+            self._tools.check_admin(sender)
+        return {"thread": thread, "sender": sender}
+
     @MessageGateway(
         name=GATEWAY_NAME,
         route_type="duplex",
@@ -477,9 +778,10 @@ class WeChatNativePlugin(MaiBotPlugin):
                     allow_group=native.group_reply_mode != "disabled",
                     max_image_bytes=native.max_image_bytes,
                 )
-                quote = None
-                if reply_id:
-                    quote = {"messageId": reply_id, "serverId": reply_id}
+                source = self._pending_source.get(self._reply_source_key(message))
+                mentions, reply_id, quote = await self._apply_reply_style(
+                    native, client, target, parts, source, mentions, reply_id
+                )
                 sent: List[str] = []
                 for kind, content in parts:
                     key = secrets.token_hex(16)
@@ -517,6 +819,80 @@ class WeChatNativePlugin(MaiBotPlugin):
             except (NativeAPIError, SendError, MediaError, ValueError) as error:
                 logger.warning("微信出站失败: %s", error)
                 return {"success": False, "error": str(error)}
+
+    def _reply_source_key(self, message: Dict[str, Any]) -> str:
+        """找出触发本次回复的入站消息 ID。
+
+        Args:
+            message: 麦麦出站消息字典。
+
+        Returns:
+            str: 匹配 ``self._pending_source`` 的键；找不到时返回空字符串。
+        """
+
+        info = message.get("message_info") or {}
+        group_info = info.get("group_info") or {}
+        thread = str(group_info.get("group_id") or "").strip()
+        if not thread:
+            user_info = info.get("user_info") or {}
+            thread = str(
+                (info.get("additional_config") or {}).get("platform_io_target_user_id")
+                or user_info.get("user_id")
+                or ""
+            ).strip()
+        if not thread:
+            return ""
+        for key in reversed(list(self._pending_source)):
+            if self._pending_source[key]["threadId"] == thread:
+                return key
+        return ""
+
+    async def _apply_reply_style(
+        self,
+        native: NativeConfig,
+        client: NativeClient,
+        target: str,
+        parts: List[Any],
+        source: Optional[Dict[str, str]],
+        mentions: List[str],
+        reply_id: Optional[str],
+    ) -> tuple[List[str], Optional[str], Optional[Dict[str, str]]]:
+        """按配置为群聊首条文字回复补充引用或 @。
+
+        Args:
+            native: 当前连接配置。
+            client: Native 客户端。
+            target: 目标会话 ID。
+            parts: 待发送的消息段。
+            source: 触发本次回复的入站消息。
+            mentions: 取消息段中的 @ 列表。
+            reply_id: 取消息段中的引用目标。
+
+        Returns:
+            tuple[List[str], Optional[str], Optional[Dict[str, str]]]: @ 列表、
+            引用消息 ID 与 Native 引用参数。
+        """
+
+        del client
+        quote = {"messageId": reply_id, "serverId": reply_id} if reply_id else None
+        if not is_group_thread(target) or not source or native.group_reply_style == "plain":
+            return mentions, reply_id, quote
+        if mentions or reply_id:
+            return mentions, reply_id, quote
+        has_text = any(part[0] == "text" for part in parts)
+        if not has_text:
+            return mentions, reply_id, quote
+        if native.group_reply_style == "quote":
+            message_id = source.get("messageId")
+            server_id = source.get("serverId")
+            if message_id and server_id:
+                reply_id = message_id
+                quote = {"messageId": message_id, "serverId": server_id}
+            return mentions, reply_id, quote
+        sender = source.get("senderId")
+        if sender and sender != self._self_id:
+            mentions = [sender]
+        return mentions, reply_id, quote
 
     def _mark_replied(self, message: Dict[str, Any]) -> None:
         """把触发本次回复的入站消息标记为已回复。

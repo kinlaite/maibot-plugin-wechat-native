@@ -24,29 +24,41 @@ class NativeConfig:
     account_id: str
     token: str
     token_file: str
+    admin_token: str
+    admin_token_file: str
     enable_private_reply: bool
     enable_media: bool
     enable_stickers: bool
     allowed_users: frozenset[str]
     allowed_groups: frozenset[str]
     group_reply_mode: Literal["mention", "all", "disabled"]
+    group_reply_style: Literal["quote", "mention", "plain"]
     reconnect_delay_seconds: int
     max_image_bytes: int
+    enable_history_tools: bool
+    enable_contact_search: bool
+    enable_wechat_actions: bool
+    enable_friend_requests: bool
+    wechat_action_admins: frozenset[str]
 
     @classmethod
-    def from_settings(cls, settings, network_settings, media_settings) -> "NativeConfig":
+    def from_settings(
+        cls, settings, network_settings, media_settings, tool_settings, action_settings
+    ) -> "NativeConfig":
         """从插件配置节构造并校验连接参数。
 
         Args:
-            settings: ``PluginConfigBase`` 的 ``native`` 配置节。
-            network_settings: ``PluginConfigBase`` 的 ``chat`` 配置节。
-            media_settings: ``PluginConfigBase`` 的 ``media`` 配置节。
+            settings: ``native`` 配置节。
+            network_settings: ``chat`` 配置节。
+            media_settings: ``media`` 配置节。
+            tool_settings: ``tools`` 配置节。
+            action_settings: ``actions`` 配置节。
 
         Returns:
             NativeConfig: 完成校验的连接配置。
 
         Raises:
-            ValueError: 服务地址、账号或 Token 配置不合法。
+            ValueError: 服务地址、账号或模式配置不合法。
         """
 
         url = str(settings.server_url or "").strip().rstrip("/")
@@ -71,11 +83,16 @@ class NativeConfig:
         mode = str(network_settings.group_reply_mode or "mention").strip()
         if mode not in {"mention", "all", "disabled"}:
             raise ValueError("group_reply_mode 必须为 mention/all/disabled")
+        style = str(network_settings.group_reply_style or "quote").strip()
+        if style not in {"quote", "mention", "plain"}:
+            raise ValueError("group_reply_style 必须为 quote/mention/plain")
         return cls(
             api_url=url if parsed.path.endswith("/v1") else url + "/v1",
             account_id=account,
             token=str(settings.token or ""),
             token_file=str(settings.token_file or ""),
+            admin_token=str(action_settings.admin_token or ""),
+            admin_token_file=str(action_settings.admin_token_file or ""),
             enable_private_reply=bool(network_settings.enable_private_reply),
             enable_media=bool(media_settings.enable_media),
             enable_stickers=bool(media_settings.enabled_stickers),
@@ -86,9 +103,37 @@ class NativeConfig:
                 str(item).strip() for item in (network_settings.allowed_groups or []) if str(item).strip()
             ),
             group_reply_mode=mode,
+            group_reply_style=style,
             reconnect_delay_seconds=int(settings.reconnect_delay_seconds or 3),
             max_image_bytes=int(media_settings.max_image_mb) * 1024 * 1024,
+            enable_history_tools=bool(tool_settings.enable_history_tools),
+            enable_contact_search=bool(tool_settings.enable_contact_search),
+            enable_wechat_actions=bool(action_settings.enable_wechat_actions),
+            enable_friend_requests=bool(action_settings.enable_friend_requests),
+            wechat_action_admins=frozenset(
+                str(item).strip() for item in (action_settings.wechat_action_admins or []) if str(item).strip()
+            ),
         )
+
+    def load_admin_token(self) -> str:
+        """读取 admin Token，未配置时返回空字符串。
+
+        Returns:
+            str: 可用于管理接口的 Token；未配置时为空。
+        """
+
+        if not self.admin_token and not self.admin_token_file:
+            return ""
+        token = self.admin_token
+        if self.admin_token_file:
+            try:
+                with open(self.admin_token_file, encoding="utf-8") as token_handle:
+                    token = token_handle.read(8193).rstrip("\r\n")
+            except (OSError, TypeError, ValueError):
+                raise ValueError("admin_token_file 不可读，请检查路径与权限") from None
+        if not token or len(token) > 8192 or any(ord(char) < 33 or ord(char) > 126 for char in token):
+            raise ValueError("admin_token 必须不含空格或控制字符")
+        return token
 
     def load_token(self) -> str:
         """读取 Token，``token_file`` 优先于内联配置。
