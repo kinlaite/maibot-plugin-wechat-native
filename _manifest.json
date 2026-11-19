@@ -12,11 +12,10 @@
   },
   "description": "通过 agent-wechat-native /v1 API 把个人微信接入麦麦，支持私聊与群聊的文本、图片、语音和引用回复。移植自 AstrBot 插件 astrbot-plugin-wechat-native（作者 neozhu，MIT）。",
   "author": {
-    "name": "neozhu",
-    "url": "https://github.com/neozhu"
+    "name": "kinlaite"
   },
   "urls": {
-    "repository": "https://github.com/neozhu/astrbot-plugin-wechat-native"
+    "repository": "https://github.com/kinlaite/maibot-plugin-wechat-native"
   },
   "license": "MIT",
   "plugin_type": "adapter",
