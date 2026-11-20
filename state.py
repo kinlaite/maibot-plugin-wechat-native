@@ -88,6 +88,36 @@ class StateStore:
     def cursor(self) -> str:
         return self.db.execute("SELECT cursor FROM checkpoint WHERE id=1").fetchone()[0]
 
+    def get_setting(self, key: str) -> str:
+        """读取一个附加设置值。
+
+        Args:
+            key: 设置名。
+
+        Returns:
+            str: 已保存的值；不存在时返回空字符串。
+        """
+
+        row = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return str(row[0]) if row else ""
+
+    def set_setting(self, key: str, value: str) -> None:
+        """写入一个附加设置值。
+
+        Args:
+            key: 设置名。
+            value: 要保存的值；传入空字符串表示删除。
+        """
+
+        with self.db:
+            if value:
+                self.db.execute(
+                    "INSERT INTO settings VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, value),
+                )
+            else:
+                self.db.execute("DELETE FROM settings WHERE key=?", (key,))
+
     def _advance(self, cursor: str):
         if cursor_number(cursor) > cursor_number(self.cursor):
             self.db.execute("UPDATE checkpoint SET cursor=? WHERE id=1", (cursor,))

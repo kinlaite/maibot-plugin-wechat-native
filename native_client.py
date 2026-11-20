@@ -253,6 +253,19 @@ def _extract_job_error_code(job: dict) -> str:
     return "request_failed"
 
 
+# Native 在取资产时就会拒绝的来源错误。它们不会因为等待或重试而恢复：
+# ``validate_sticker_url`` 只接受固定 CDN 白名单（``snsvideo.c2c.wechat.com``、
+# ``wxapp.tc.qq.com``），其它来源直接返回 409，连下载任务都不会创建。
+STICKER_UNRECOVERABLE_CODES = frozenset(
+    {
+        "sticker_source_not_allowed",
+        "sticker_source_unavailable",
+        "sticker_source_dns_not_public",
+        "sticker_metadata_invalid",
+    }
+)
+
+
 def _map_media_code(
     code: str | None, *, quoted: bool = False, status: int = 0, media_kind: str = "image"
 ) -> MediaError:
@@ -286,6 +299,8 @@ def _map_media_code(
         "media_audio_invalid",
         "unsupported_voice_chunk",
     }:
+        return MediaError("unsupported_format", media_kind=media_kind)
+    if code in STICKER_UNRECOVERABLE_CODES:
         return MediaError("unsupported_format", media_kind=media_kind)
     return MediaError("unavailable", media_kind=media_kind)
 
@@ -876,6 +891,23 @@ class NativeClient:
             expected_status=200,
         )
         return self._login_operation(value, operation_id)
+
+    async def cancel_login(self, operation_id) -> None:
+        """取消一个登录操作，释放 Native 侧的被占用状态。
+
+        Args:
+            operation_id: 要取消的登录操作 ID。
+
+        Raises:
+            NativeAPIError: Native 拒绝取消时抛出。
+        """
+
+        await self._request(
+            "POST",
+            self.prefix + "/login-attempts/" + quote(operation_id, safe="") + "/cancel",
+            expected_status=200,
+            json={},
+        )
 
     async def login_qr(self, operation_id, generation):
         if type(generation) is not int or generation < 1 or self.closed:
