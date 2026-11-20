@@ -6,6 +6,8 @@
 from typing import Any, Dict, List
 from unittest.mock import Mock
 
+import base64
+import hashlib
 import os
 import sys
 from datetime import datetime, timezone
@@ -14,14 +16,34 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from wechat_native import plugin as plugin_module  # noqa: E402
+from wechat_native.codec import segments_from_media as plugin_module_segments_from_media  # noqa: E402
 from wechat_native.config import NativeConfig  # noqa: E402
 
 
 class FakeClient:
     """记录出站调用的 Native 客户端替身。"""
 
-    def __init__(self) -> None:
+    def __init__(self, account: Dict[str, Any] | None = None) -> None:
         self.calls: List[tuple] = []
+        self.account_payload = account if account is not None else {
+            "id": "acct",
+            "ownUsername": "wxid_bot",
+            "authenticated": True,
+            "connection": "online",
+        }
+        self.account_checks = 0
+
+    async def account(self):
+        self.account_checks += 1
+        return dict(self.account_payload)
+
+    async def media_assets(self, message_id: str):
+        self.calls.append(("media_assets", message_id))
+        return {"items": [{"id": "asset_1", "kind": "sticker", "state": "available", "source": "message"}]}
+
+    async def media_content(self, asset_id: str, **kwargs):
+        self.calls.append(("media_content", asset_id, kwargs))
+        return b"\x89PNG\r\n\x1a\n" + b"\x00" * 8, "image/png"
 
     async def send_text(self, thread, text, key, mentions=None, *, quote=None):
         self.calls.append(("text", thread, text, mentions, quote))
@@ -75,7 +97,6 @@ def _config(**overrides: Any) -> NativeConfig:
         "allowed_users": frozenset(),
         "allowed_groups": frozenset(),
         "group_reply_mode": "enabled",
-        "group_reply_style": "quote",
         "reconnect_delay_seconds": 3,
         "max_image_bytes": 10 * 1024 * 1024,
         "admin_token": "",
@@ -118,6 +139,212 @@ def _raw(**overrides: Any) -> Dict[str, Any]:
     return raw
 
 
+def test_account_connection_event_refreshes_ready_state(tmp_path) -> None:
+    """登录成功后 Native 只发 account.connection 事件。
+
+    事件流稳定时主循环不会再检查账号，若不处理该事件，
+    网关会一直停在“等待微信登录”，入站消息全部被宿主拒收。
+    """
+
+    store = plugin_module.StateStore(tmp_path / "state.db")
+    store.advance("10")
+    gateway = FakeGateway()
+    client = FakeClient(
+        {
+            "id": "acct",
+            "ownUsername": "wxid_bot",
+            "authenticated": False,
+            "connection": "disconnected",
+        }
+    )
+    instance = _build(store, gateway, client, _config())
+    instance._ready = False
+
+    event = {"kind": "account.connection", "cursor": "11", "data": {"state": "auth_required"}}
+    plugin_module.asyncio.run(instance._handle_event(event, store))
+    assert instance._ready is False
+    assert client.account_checks == 1
+    assert store.cursor == "11"
+
+    # 扫码完成后 Native 变为在线，再推一条连接事件。
+    client.account_payload = {
+        "id": "acct",
+        "ownUsername": "wxid_bot",
+        "authenticated": True,
+        "connection": "online",
+    }
+    event = {"kind": "account.connection", "cursor": "12", "data": {"state": "online"}}
+    plugin_module.asyncio.run(instance._handle_event(event, store))
+
+    assert instance._ready is True
+    assert instance._self_id == "wxid_bot"
+    assert store.cursor == "12"
+
+
+def test_animated_sticker_bytes_are_passed_through(tmp_path) -> None:
+    """表情字节原样透传，GIF 抽帧交给宿主的 emoji_manager。
+
+    适配器不再自行转码：重复转码既改变原始字节，也和宿主的表情处理链路冲突。
+    """
+
+    from io import BytesIO
+
+    from PIL import Image
+
+    frames = []
+    for color in ((255, 0, 0), (0, 255, 0)):
+        frames.append(Image.new("RGB", (32, 32), color))
+    buffer = BytesIO()
+    frames[0].save(buffer, format="GIF", save_all=True, append_images=frames[1:], duration=100, loop=0)
+    gif_bytes = buffer.getvalue()
+    assert gif_bytes[:3] == b"GIF"
+
+    segments = plugin_module_segments_from_media([], None, stickers=[gif_bytes])
+    emoji = segments[0]
+    assert emoji["type"] == "emoji"
+
+    decoded = base64.b64decode(emoji["binary_data_base64"])
+    assert decoded == gif_bytes
+    assert emoji["hash"] == hashlib.sha256(gif_bytes).hexdigest()
+
+
+def test_static_sticker_is_sent_unchanged(tmp_path) -> None:
+    """静态表情不需要重新编码，字节要保持一致。"""
+
+    from io import BytesIO
+
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (16, 16), (0, 0, 255)).save(buffer, format="PNG")
+    png_bytes = buffer.getvalue()
+
+    segments = plugin_module_segments_from_media([], None, stickers=[png_bytes])
+    decoded = base64.b64decode(segments[0]["binary_data_base64"])
+    assert decoded == png_bytes
+
+
+def test_sticker_message_without_media_enabled_keeps_original_body(tmp_path) -> None:
+    """type=47 的表情消息正文是 null，适配器不能自己编一句正文。
+
+    媒体开关关闭时确实没有内容可交给宿主，但补占位等于伪造用户发言；
+    正文由宿主按消息类型自行呈现。
+    """
+
+    store = plugin_module.StateStore(tmp_path / "state.db")
+    gateway = FakeGateway()
+    instance = _build(store, gateway, FakeClient(), _config(enable_media=False))
+    raw = _raw(type=47, body=None)
+
+    plugin_module.asyncio.run(instance._receive_message(raw, store))
+
+    assert len(gateway.messages) == 1
+    assert gateway.messages[0]["raw_message"] == []
+
+
+def test_sticker_asset_marks_message_even_when_stickers_disabled(tmp_path) -> None:
+    """关闭表情读取时仍要识别出表情，但不把表情当成普通图片。"""
+
+    store = plugin_module.StateStore(tmp_path / "state.db")
+    gateway = FakeGateway()
+    client = FakeClient()
+    instance = _build(store, gateway, client, _config(enable_media=True, enable_stickers=False))
+    raw = _raw(type=47, body=None)
+
+    plugin_module.asyncio.run(instance._receive_message(raw, store))
+
+    assert len(gateway.messages) == 1
+    message = gateway.messages[0]
+    assert message["is_emoji"] is True
+    assert message["raw_message"] == []
+    # 关闭表情读取时，表情不应该作为图片附件发给模型。
+    assert not any(call[0] == "media_content" for call in client.calls)
+
+
+def test_sticker_asset_is_read_as_image_when_enabled(tmp_path) -> None:
+    """开启表情读取后，表情应当以 emoji 段发给模型。
+
+    对齐 QQ 适配器：表情用 ``type: "emoji"`` 而不是 ``"image"``。
+    宿主据此生成 EmojiComponent，视觉链路才会把表情当图片读给模型。
+    """
+
+    store = plugin_module.StateStore(tmp_path / "state.db")
+    gateway = FakeGateway()
+    client = FakeClient()
+    instance = _build(store, gateway, client, _config(enable_media=True, enable_stickers=True))
+    raw = _raw(type=47, body=None)
+
+    plugin_module.asyncio.run(instance._receive_message(raw, store))
+
+    assert len(gateway.messages) == 1
+    segments = gateway.messages[0]["raw_message"]
+    # 表情消息的 body 是 null，适配器不能补一句假扮用户发言的正文。
+    assert segments == [segments[0]]
+    assert segments[0]["type"] == "emoji"
+    assert segments[0]["data"] == ""
+    assert segments[0]["binary_data_base64"]
+    assert segments[0]["hash"]
+    assert any(call[0] == "media_content" for call in client.calls)
+
+
+def test_sticker_source_not_allowed_degrades_without_retry(tmp_path) -> None:
+    """来源被 Native 白名单拒绝时不该重试，应立刻退化成占位。
+
+    Native 的 ``validate_sticker_url`` 只接受固定 CDN 白名单，其它来源在取资产
+    阶段就返回 409；等待和重试都不会改变结果，只会拖慢这条消息的处理。
+    """
+
+    class RejectedStickerClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        async def media_content(self, asset_id: str, **kwargs):
+            self.attempts += 1
+            raise plugin_module.MediaError("unsupported_format", media_kind="sticker")
+
+    store = plugin_module.StateStore(tmp_path / "state.db")
+    gateway = FakeGateway()
+    client = RejectedStickerClient()
+    instance = _build(store, gateway, client, _config(enable_media=True, enable_stickers=True))
+
+    plugin_module.asyncio.run(instance._receive_message(_raw(type=47, body=None), store))
+
+    assert client.attempts == 1
+    assert len(gateway.messages) == 1
+    message = gateway.messages[0]
+    # 取不到表情图片时不伪造正文，消息保持原样（body 为 null 即无正文）。
+    assert message["raw_message"] == []
+
+
+def test_sticker_retries_while_native_download_is_pending(tmp_path) -> None:
+    """表情异步下载未完成时 Native 返回 unavailable，应当重试而不是降级。"""
+
+    class SlowStickerClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        async def media_content(self, asset_id: str, **kwargs):
+            self.attempts += 1
+            self.calls.append(("media_content", asset_id, kwargs))
+            if self.attempts < 3:
+                raise plugin_module.MediaError("unavailable", media_kind="sticker")
+            return b"GIF89a" + b"\x00" * 8, "image/gif"
+
+    store = plugin_module.StateStore(tmp_path / "state.db")
+    gateway = FakeGateway()
+    client = SlowStickerClient()
+    instance = _build(store, gateway, client, _config(enable_media=True, enable_stickers=True))
+
+    plugin_module.asyncio.run(instance._receive_message(_raw(type=47, body=None), store))
+
+    assert len(gateway.messages) == 1
+    segments = gateway.messages[0]["raw_message"]
+    assert segments[0]["type"] == "emoji"
+    assert client.attempts == 3
+
+
 def test_private_message_is_routed(tmp_path) -> None:
     store = plugin_module.StateStore(tmp_path / "state.db")
     gateway = FakeGateway()
@@ -152,7 +379,8 @@ def test_group_message_routed_when_mentioned(tmp_path) -> None:
     plugin_module.asyncio.run(instance._receive_message(raw, store))
     assert len(gateway.messages) == 1
     assert gateway.messages[0]["message_info"]["group_info"]["group_id"] == "1@chatroom"
-    assert gateway.messages[0]["raw_message"][0]["data"] == "在吗"
+    # Native 没给出 @ 目标 ID 时不能凭空指定目标，正文原样保留。
+    assert gateway.messages[0]["raw_message"] == [{"type": "text", "data": "@麦麦 在吗"}]
 
 
 def test_disallowed_user_is_ignored(tmp_path) -> None:

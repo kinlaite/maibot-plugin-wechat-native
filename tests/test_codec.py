@@ -64,23 +64,41 @@ def test_group_message_carries_group_info() -> None:
     assert group["group_name"] == "测试群"
 
 
-def test_mention_prefix_is_stripped() -> None:
-    raw = _raw(threadId="12345@chatroom", body="@麦麦\u2005 早", mentions={"state": "known", "self": True})
+def test_mention_prefix_is_kept_as_at_segment() -> None:
+    """@ 机器人要变成 at 段，正文原样保留，不做剥离。"""
+
+    raw = _raw(
+        threadId="12345@chatroom",
+        accountId="acct",
+        body="@麦麦\u2005 早",
+        mentions={"state": "known", "self": True, "userIds": ["wxid_bot"]},
+    )
     message = inbound(raw, "acct", text="@麦麦\u2005 早", segments=[], self_id="wxid_bot")
-    assert message["raw_message"][0]["data"] == "早"
+    assert message["raw_message"] == [
+        {
+            "type": "at",
+            "data": {"target_user_id": "wxid_bot", "target_user_nickname": "麦麦", "target_user_cardname": None},
+        },
+        {"type": "text", "data": "早"},
+    ]
 
 
-def test_quote_is_prefixed_to_text() -> None:
-    raw = _raw(type=49)
+def test_quote_is_structured_not_prefixed_to_text() -> None:
+    """引用要作为 reply 段，不能拼进正文冒充发言者自己说的话。"""
+
+    raw = _raw(type=49, accountId="acct")
     message = inbound(
         raw,
         "acct",
         text="看这个",
         segments=[],
         self_id="wxid_bot",
-        quote={"text": "原消息", "serverId": "s-1"},
+        quote={"embeddedText": "原消息", "serverId": "s-1", "senderName": "张三"},
     )
-    assert message["raw_message"][0]["data"] == "[引用消息] 原消息\n看这个"
+    assert message["raw_message"][0]["type"] == "reply"
+    assert message["raw_message"][0]["data"]["target_message_content"] == "原消息"
+    assert message["raw_message"][0]["data"]["target_message_id"] == "acct:wxid_friend:s-1"
+    assert message["raw_message"][1] == {"type": "text", "data": "看这个"}
 
 
 def test_outbound_preserves_order_and_mentions() -> None:
@@ -104,6 +122,28 @@ def test_outbound_preserves_order_and_mentions() -> None:
     assert [part[0] for part in parts] == ["text", "image"]
     assert mentions == ["wxid_member"]
     assert reply_id == "msg-2"
+
+
+def test_outbound_reads_host_at_segment_data() -> None:
+    """宿主把 at 目标放在 data 里，读错字段会让机器人 @ 不到任何人。"""
+
+    message = {
+        "platform": "wechat_native",
+        "account_id": "acct",
+        "message_info": {
+            "group_info": {"group_id": "12345@chatroom", "group_name": "群"},
+            "additional_config": {},
+        },
+        "raw_message": [
+            {"type": "at", "data": {"target_user_id": "wxid_member", "target_user_nickname": "乐安"}},
+            {"type": "text", "data": " 在吗"},
+        ],
+    }
+    target, parts, mentions, reply_id = outbound(message, allow_group=True, max_image_bytes=1024)
+    assert target == "12345@chatroom"
+    assert mentions == ["wxid_member"]
+    assert parts == [("text", " 在吗")]
+    assert reply_id is None
 
 
 def test_outbound_rejects_group_when_disabled() -> None:

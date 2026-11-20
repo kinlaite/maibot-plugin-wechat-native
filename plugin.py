@@ -18,8 +18,6 @@ import secrets
 import time
 
 from .codec import (
-    DEFAULT_IMAGE_PROMPT,
-    DEFAULT_PDF_PROMPT,
     PLATFORM,
     inbound,
     is_group_thread,
@@ -46,6 +44,8 @@ from .tools import ToolUnavailable, WechatNativeTools, describe_error, tool_name
 
 GATEWAY_NAME = "wechat_native_gateway"
 MEDIA_RETRY_SECONDS = 3
+STICKER_FETCH_RETRY_DELAYS = (0.2, 0.5, 1.0, 2.0)
+"""表情由 Native 异步下载，刚收到消息时可能还没有就绪，按此递增等待。"""
 GROUP_NAME_TTL_SECONDS = 600.0
 COMPOSED_GROUP_NAME_LIMIT = 4
 CONTACT_LOOKUP_LIMIT = 200
@@ -237,6 +237,9 @@ class WeChatNativePlugin(MaiBotPlugin):
         session = LoginSession()
         session.message = "正在向 Native 申请二维码…"
         session.tone = "neutral"
+        # 上一轮的操作可能还停在 Native 侧（页面关闭、任务被取消），
+        # 直接把 ID 交给本次尝试，生成前先取消掉。
+        session.operation_id = old.operation_id or self._stored_login_operation()
         self._login = session
 
         async def run() -> None:
@@ -245,11 +248,12 @@ class WeChatNativePlugin(MaiBotPlugin):
                 await client.open()
                 try:
                     await start_login(client, session)
+                    self._store_login_operation(session.operation_id)
                 except NativeAPIError as error:
                     if error.status == 409 and error.code == "operation_in_progress":
                         session.message = (
-                            "该微信账号已有正在进行的登录操作；若账号已在线则无需扫码，"
-                            "如需重新登录请先在 Native 侧断开该账号"
+                            "该微信账号仍被上一次登录操作占用（已自动重试）。"
+                            "请在 Native 侧断开该账号后重试，或等待占用超时"
                         )
                     else:
                         session.message = f"Native 拒绝发起登录（HTTP {error.status}，{error.code or 'unknown'}）"
@@ -271,11 +275,13 @@ class WeChatNativePlugin(MaiBotPlugin):
     async def _handle_cancel_login(self) -> None:
         """取消正在进行的扫码登录。
 
-        不取消的话，扫错码或想换号时只能等 10 分钟超时，
-        期间 Native 侧还占着一条登录操作，无法重新发起。
+        只取消本地任务不够：Native 侧的登录操作会一直停在 awaiting_scan
+        并占住账号，导致之后每次生成二维码都返回 409。这里必须同时取消
+        Native 上的操作。
         """
 
         session = self._login
+        operation_id = session.operation_id or self._stored_login_operation()
         task = session.task
         if task is not None and not task.done():
             task.cancel()
@@ -285,6 +291,59 @@ class WeChatNativePlugin(MaiBotPlugin):
         session.reset()
         session.message = "已取消扫码登录"
         session.tone = "neutral"
+        if operation_id:
+            await self._cancel_native_login(operation_id)
+            self._store_login_operation("")
+
+    async def _cancel_native_login(self, operation_id: str) -> None:
+        """取消 Native 侧的登录操作，释放被占用账号。
+
+        Args:
+            operation_id: 要取消的登录操作 ID。
+        """
+
+        try:
+            native = NativeConfig.from_settings(
+                self.config.native, self.config.chat, self.config.media, self.config.tools, self.config.actions
+            )
+            token = native.load_token()
+        except ValueError as error:
+            logger.warning("取消登录操作失败，登录配置无效: %s", error)
+            return
+        client = NativeClient(native.api_url, native.account_id, token)
+        try:
+            await client.open()
+            await client.cancel_login(operation_id)
+        except Exception as error:  # noqa: BLE001 - 取消失败不应影响页面状态
+            logger.warning("取消 Native 登录操作失败: %s", error)
+        finally:
+            with suppress(Exception):
+                await client.close()
+
+    def _stored_login_operation(self) -> str:
+        """读取上次未收尾的登录操作 ID。
+
+        Returns:
+            str: 持久化的操作 ID；没有记录时返回空字符串。
+        """
+
+        try:
+            return self._require_store().get_setting("login_operation_id")
+        except Exception as error:  # noqa: BLE001 - 状态库不可用时按无记录处理
+            logger.debug("读取登录操作记录失败: %s", error)
+            return ""
+
+    def _store_login_operation(self, operation_id: str) -> None:
+        """记录或清除未收尾的登录操作 ID。
+
+        Args:
+            operation_id: 当前操作 ID；传空字符串表示已收尾。
+        """
+
+        try:
+            self._require_store().set_setting("login_operation_id", operation_id)
+        except Exception as error:  # noqa: BLE001 - 记录失败不应影响登录
+            logger.debug("写入登录操作记录失败: %s", error)
 
     async def on_config_widget_action(self, action_id: str) -> None:
         """处理配置页操作按钮。
@@ -397,6 +456,31 @@ class WeChatNativePlugin(MaiBotPlugin):
             # 抛出的异常会让整个事件流永久退出，反而更收不到消息。
             logger.error("麦麦未接受 WeChat Native 网关路由，入站消息可能被拒绝")
 
+    async def _refresh_account_state(self) -> None:
+        """按 Native 当前账号状态刷新网关就绪状态。
+
+        Native 侧登录态会在运行期间变化，事件流稳定时主循环不会重新检查，
+        因此登录成功或掉线后必须主动刷新一次。
+        """
+
+        client = self._client
+        if client is None:
+            return
+        try:
+            account = await client.account()
+        except Exception as error:  # noqa: BLE001 - 状态刷新失败不应中断事件流
+            logger.debug("刷新 Native 账号状态失败: %s", error)
+            return
+        native = self._native
+        if native is not None and account.get("id") != native.account_id:
+            logger.error("WeChat Native 账号身份不匹配，忽略本次状态刷新")
+            return
+        self._self_id = str(account.get("ownUsername") or (native.account_id if native else ""))
+        if not account.get("authenticated") or account.get("connection") != "online":
+            await self._set_ready(False, "Native 账号尚未在线，等待微信登录")
+            return
+        await self._set_ready(True, f"{self._self_id}（微信已在线）")
+
     async def _run(self) -> None:
         """保持事件流连接，断线后按退避间隔重连。"""
 
@@ -420,10 +504,7 @@ class WeChatNativePlugin(MaiBotPlugin):
                         raise ValueError("account_identity_mismatch")
                     self._self_id = str(account.get("ownUsername") or native.account_id)
                     await self._bind_server_identity(client, store)
-                    if not account.get("authenticated") or account.get("connection") != "online":
-                        await self._set_ready(False, "Native 账号尚未在线，等待微信登录")
-                    else:
-                        await self._set_ready(True, f"{self._self_id}（微信已在线）")
+                    await self._refresh_account_state()
                     await self._guard_cursor(client, store)
                     await self._ensure_cursor_in_window(client, store)
                     async for event in client.events(store.cursor):
@@ -620,6 +701,12 @@ class WeChatNativePlugin(MaiBotPlugin):
             )
             store.advance(cursor)
             return
+        if kind == "account.connection":
+            # Native 只在这里通知登录态变化；事件流稳定时上面的账号检查
+            # 不会再跑，忽略它就会一直停在“等待微信登录”。
+            await self._refresh_account_state()
+            store.advance(cursor)
+            return
         if kind != "message.committed":
             store.advance(cursor)
             return
@@ -710,17 +797,13 @@ class WeChatNativePlugin(MaiBotPlugin):
         voice: Optional[bytes] = None
         pdf_name = ""
         pdf_text = ""
+        stickers: List[bytes] = []
         if native.enable_media:
-            images, voice, pdf_name, pdf_text = await self._load_media(native, raw, client)
-        segments = segments_from_media(images, voice, pdf_name, pdf_text)
+            images, voice, pdf_name, pdf_text, stickers = await self._load_media(native, raw, client)
+        segments = segments_from_media(images, voice, pdf_name, pdf_text, stickers)
+        # 正文只用 Native 给出的原文。媒体说明由宿主按消息段自行生成：
+        # 这里补一句「对方发来一个微信表情」等于替用户说话，模型会把它当成用户的原话。
         text = body
-        if not text.strip():
-            if images:
-                text = DEFAULT_IMAGE_PROMPT
-            elif voice is not None:
-                text = "[语音]"
-            elif pdf_name:
-                text = DEFAULT_PDF_PROMPT
         quote = raw.get("quote") if isinstance(raw.get("quote"), dict) else None
         group_name = str(raw.get("groupName") or "")
         if group and not group_name:
@@ -788,7 +871,7 @@ class WeChatNativePlugin(MaiBotPlugin):
         raw: Dict[str, Any],
         quoted: Dict[str, Any],
         client: NativeClient,
-    ) -> tuple[List[bytes], Optional[bytes], str, str]:
+    ) -> tuple[List[bytes], Optional[bytes], str, str, List[bytes]]:
         """下载被引用消息里的媒体。
 
         引用预览只给标记不给正文，必须按 ``serverId`` 反查同会话的原消息，
@@ -801,10 +884,11 @@ class WeChatNativePlugin(MaiBotPlugin):
             client: Native 客户端。
 
         Returns:
-            tuple[List[bytes], Optional[bytes], str, str]: 图片、语音、PDF 文件名与正文。
+            tuple[List[bytes], Optional[bytes], str, str, bool]: 图片、语音、PDF 文件名与正文，
+            以及原消息是否含表情。
         """
 
-        empty: tuple[List[bytes], Optional[bytes], str, str] = ([], None, "", "")
+        empty: tuple[List[bytes], Optional[bytes], str, str, List[bytes]] = ([], None, "", "", [])
         thread = str(raw.get("threadId") or "")
         server_id = str(quoted.get("serverId") or "")
         if not thread or not server_id:
@@ -988,9 +1072,44 @@ class WeChatNativePlugin(MaiBotPlugin):
         self._contact_names[user_id] = (name, now)
         return name
 
+    async def _sticker_bytes(
+        self, client: NativeClient, asset_id: str, native: NativeConfig
+    ) -> Optional[bytes]:
+        """读取表情图片，自动等待 Native 的异步下载完成。
+
+        表情由 Native 在消息到达后异步下载，紧接着读取可能返回
+        ``media_not_available``；这里短暂重试，避免把可读的表情降级成占位。
+
+        Args:
+            client: Native 客户端。
+            asset_id: 表情资产 ID。
+            native: 当前连接配置。
+
+        Returns:
+            Optional[bytes]: 表情图片数据；确实取不到时返回 ``None``。
+        """
+
+        for delay in STICKER_FETCH_RETRY_DELAYS:
+            try:
+                data, _ = await client.media_content(asset_id, max_bytes=native.max_image_bytes)
+                return data
+            except (NativeAPIError, MediaError) as error:
+                if isinstance(error, MediaError) and error.reason == "unsupported_format":
+                    # 来源被 Native 白名单拒绝，重试也不会变化，直接降级。
+                    logger.info("微信表情来源被 Native 拒绝，退化为占位: asset=%s error=%s", asset_id, error)
+                    return None
+                logger.debug("微信表情暂时不可用，%.2f 秒后重试: asset=%s error=%s", delay, asset_id, error)
+                await asyncio.sleep(delay)
+        try:
+            data, _ = await client.media_content(asset_id, max_bytes=native.max_image_bytes)
+            return data
+        except (NativeAPIError, MediaError) as error:
+            logger.info("微信表情读取失败，退化为占位: asset=%s error=%s", asset_id, error)
+            return None
+
     async def _load_media(
         self, native: NativeConfig, raw: Dict[str, Any], client: NativeClient
-    ) -> tuple[List[bytes], Optional[bytes], str, str]:
+    ) -> tuple[List[bytes], Optional[bytes], str, str, bool]:
         """读取消息附带的图片、语音与 PDF。
 
         Args:
@@ -999,28 +1118,30 @@ class WeChatNativePlugin(MaiBotPlugin):
             client: Native 客户端。
 
         Returns:
-            tuple[List[bytes], Optional[bytes], str, str]: 图片列表、语音数据、
-            PDF 文件名与提取正文。
+            tuple[List[bytes], Optional[bytes], str, str, List[bytes]]: 图片列表、语音数据、
+            PDF 文件名、PDF 提取正文，以及表情图片列表。
         """
 
         images: List[bytes] = []
         voice: Optional[bytes] = None
         pdf_name = ""
         pdf_text = ""
-        if raw.get("type") not in {3, 34, 49} and not raw.get("media"):
-            return images, voice, pdf_name, pdf_text
+        stickers: List[bytes] = []
+        if raw.get("type") not in {3, 34, 47, 49} and not raw.get("media"):
+            return images, voice, pdf_name, pdf_text, stickers
         quoted = raw.get("quote")
         if (
             raw.get("type") == 49
             and raw.get("appMessageType") == 57
             and isinstance(quoted, dict)
-            and quoted.get("type") in {3, 34, 49}
+            and quoted.get("type") in {3, 34, 47, 49}
         ):
             # 被引用的是一条媒体消息：引用预览里没有内容，必须回到原消息下载。
-            quoted_images, quoted_voice, quoted_name, quoted_text = await self._load_quoted_media(
+            quoted_images, quoted_voice, quoted_name, quoted_text, quoted_stickers = await self._load_quoted_media(
                 native, raw, quoted, client
             )
             images.extend(quoted_images)
+            stickers.extend(quoted_stickers)
             if quoted_voice is not None:
                 voice = quoted_voice
             if quoted_name:
@@ -1030,10 +1151,10 @@ class WeChatNativePlugin(MaiBotPlugin):
             body = await client.media_assets(str(raw["id"]))
         except (NativeAPIError, MediaError) as error:
             logger.info("微信消息无可用媒体: message=%s error=%s", raw.get("id"), error)
-            return images, voice, pdf_name, pdf_text
+            return images, voice, pdf_name, pdf_text, stickers
         items = body.get("items") if isinstance(body, dict) else None
         if not isinstance(items, list):
-            return images, voice, pdf_name, pdf_text
+            return images, voice, pdf_name, pdf_text, stickers
         for item in items:
             if not isinstance(item, dict) or item.get("source") not in {None, "message"}:
                 continue
@@ -1047,10 +1168,15 @@ class WeChatNativePlugin(MaiBotPlugin):
                     data, _ = await client.media_content(asset_id, max_bytes=native.max_image_bytes)
                     images.append(data)
                 elif kind == "sticker":
+                    # 表情本身就是这条消息的内容（type=47 的 body 是 null），
+                    # 默认转成表情段交给模型；关闭表情读取时只留占位文本。
+                    has_sticker = True
                     if not native.enable_stickers:
                         continue
-                    data, _ = await client.media_content(asset_id, preview=True)
-                    images.append(data)
+                    data = await self._sticker_bytes(client, asset_id, native)
+                    if data is None:
+                        continue
+                    stickers.append(data)
                 elif kind == "voice":
                     data, _ = await client.media_content(asset_id, max_bytes=MAX_VOICE_BYTES)
                     voice = data
@@ -1065,7 +1191,7 @@ class WeChatNativePlugin(MaiBotPlugin):
                         pdf_text = ""
             except (NativeAPIError, MediaError) as error:
                 logger.info("微信媒体读取失败: message=%s kind=%s error=%s", raw.get("id"), kind, error)
-        return images, voice, pdf_name, pdf_text
+        return images, voice, pdf_name, pdf_text, stickers
 
     @Tool(
         "wechat_search_history",
@@ -1430,7 +1556,7 @@ class WeChatNativePlugin(MaiBotPlugin):
                 )
                 source = self._pending_source.get(self._reply_source_key(message))
                 mentions, reply_id, quote = await self._apply_reply_style(
-                    native, client, target, parts, source, mentions, reply_id
+                    target, source, mentions, reply_id
                 )
                 if mentions == ["all"] and not await self._can_mention_all(client, target):
                     raise ValueError(
@@ -1587,52 +1713,39 @@ class WeChatNativePlugin(MaiBotPlugin):
 
     async def _apply_reply_style(
         self,
-        native: NativeConfig,
-        client: NativeClient,
         target: str,
-        parts: List[Any],
         source: Optional[Dict[str, str]],
         mentions: List[str],
         reply_id: Optional[str],
     ) -> tuple[List[str], Optional[str], Optional[Dict[str, str]]]:
-        """按配置为群聊首条文字回复补充引用或 @。
+        """把宿主出站消息里的 @ 与引用翻成 Native 参数。
+
+        适配器只做翻译，不做决定：宿主给了 reply 段就引用，没给就不引用；
+        宿主给了 at 段就 @，没给就不 @。任何「按概率自动补引用」「自动 @ 触发者」
+        都是在替宿主改写消息内容，会让模型看到的和微信里实际发出的不一致。
 
         Args:
-            native: 当前连接配置。
-            client: Native 客户端。
             target: 目标会话 ID。
-            parts: 待发送的消息段。
             source: 触发本次回复的入站消息。
-            mentions: 取消息段中的 @ 列表。
-            reply_id: 取消息段中的引用目标。
+            mentions: 宿主消息段中的 @ 列表。
+            reply_id: 宿主消息段中的引用目标。
 
         Returns:
             tuple[List[str], Optional[str], Optional[Dict[str, str]]]: @ 列表、
             引用消息 ID 与 Native 引用参数。
         """
 
-        del client
-        # Native 引用要求 messageId 与 serverId 是两个不同的值；
-        # 只拿到 reply_id 时无法拼出合法的引用参数，直接放弃引用。
-        quote = None
-        if not is_group_thread(target) or not source or native.group_reply_style == "plain":
-            return mentions, reply_id, quote
-        if mentions or reply_id:
-            return mentions, reply_id, quote
-        has_text = any(part[0] == "text" for part in parts)
-        if not has_text:
-            return mentions, reply_id, quote
-        if native.group_reply_style == "quote":
-            message_id = str(source.get("messageId") or "")
-            server_id = str(source.get("serverId") or "")
-            if message_id and server_id:
-                reply_id = message_id
-                quote = {"messageId": message_id, "serverId": server_id}
-            return mentions, reply_id, quote
-        sender = source.get("senderId")
-        if sender and sender != self._self_id:
-            mentions = [sender]
-        return mentions, reply_id, quote
+        if not is_group_thread(target) or not reply_id:
+            return mentions, reply_id, None
+        # Native 引用要求 messageId 与 serverId 是两个不同的值。
+        # 宿主只给得出被引用消息的 ID，配对信息要从触发消息的来源里取。
+        if source is None:
+            return mentions, reply_id, None
+        message_id = str(source.get("messageId") or "")
+        server_id = str(source.get("serverId") or "")
+        if not message_id or not server_id:
+            return mentions, reply_id, None
+        return mentions, message_id, {"messageId": message_id, "serverId": server_id}
 
     def _mark_replied(self, message: Dict[str, Any]) -> None:
         """把触发本次回复的入站消息标记为已回复。

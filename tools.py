@@ -10,7 +10,7 @@ import asyncio
 import secrets
 import unicodedata
 
-from .codec import is_group_thread, split_message_id, strip_mentions
+from .codec import is_group_thread, split_message_id
 from .config import NativeConfig
 from .log import logger
 from .native_client import NativeAPIError, NativeClient
@@ -734,7 +734,6 @@ def _project_messages(raw: Dict[str, Any]) -> Dict[str, Any]:
     for item in raw.get("items") or []:
         if not isinstance(item, dict) or item.get("deleted") is True:
             continue
-        body = strip_mentions(str(item.get("body") or "")).strip()
         messages.append(
             {
                 "message_id": str(item.get("id") or ""),
@@ -744,7 +743,8 @@ def _project_messages(raw: Dict[str, Any]) -> Dict[str, Any]:
                 "direction": str(item.get("direction") or ""),
                 "timestamp": str(item.get("createdAt") or ""),
                 "type": message_type_name(item.get("type")),
-                "text": body,
+                # 正文原样返回：@ 标记属于消息内容，去掉会让模型读错是谁在跟谁说话。
+                "text": str(item.get("body") or ""),
             }
         )
     result: Dict[str, Any] = {"messages": messages}
@@ -752,29 +752,6 @@ def _project_messages(raw: Dict[str, Any]) -> Dict[str, Any]:
     if next_cursor:
         result["next_cursor"] = next_cursor
     return result
-
-
-def _clean_announcement(text: str) -> str:
-    """清理群公告里的图片占位符与重复行。
-
-    微信公告常把图片渲染成 ``[图片]``，同一条公告还会重复出现，
-    原样交给模型只会浪费上下文。
-
-    Args:
-        text: 原始群公告。
-
-    Returns:
-        str: 清理后的公告；全部是占位符时返回空字符串。
-    """
-
-    seen: List[str] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped in {"[图片]", "[视频]", "[语音]", "[表情]"}:
-            continue
-        if stripped not in seen:
-            seen.append(stripped)
-    return "\n".join(seen)
 
 
 def _summary_group(info: Dict[str, Any]) -> str:
@@ -791,7 +768,9 @@ def _summary_group(info: Dict[str, Any]) -> str:
     lines = [f"群名称：{name}" if name else "群名称：未同步（微信侧尚未下发群名）"]
     if owner := str(info.get("owner_id") or "").strip():
         lines.append(f"群主：{owner}")
-    if announcement := _clean_announcement(str(info.get("announcement") or "")):
+    # 公告原样给出：删占位符或去重都会改动群主实际发布的内容。
+    announcement = str(info.get("announcement") or "").strip()
+    if announcement:
         lines.append(f"群公告：{announcement}")
     if mine := str(info.get("my_display_name") or "").strip():
         lines.append(f"我在本群的昵称：{mine}")

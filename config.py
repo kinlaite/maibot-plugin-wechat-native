@@ -19,8 +19,6 @@ CURSOR_PROBE_SECONDS = 1.2
 MAX_TEXT_BYTES = 16384
 # 游标过期后要把整个事件窗口读完才能确定真实上界，比普通探测更慢。
 WINDOW_DRAIN_SECONDS = 12.0
-DEFAULT_IMAGE_PROMPT = "请描述这张图片的内容。"
-DEFAULT_PDF_PROMPT = "请阅读并总结这份 PDF 文件的主要内容。"
 
 
 @dataclass(frozen=True)
@@ -39,7 +37,6 @@ class NativeConfig:
     allowed_users: frozenset[str]
     allowed_groups: frozenset[str]
     group_reply_mode: Literal["enabled", "disabled"]
-    group_reply_style: Literal["quote", "mention", "plain"]
     reconnect_delay_seconds: int
     max_image_bytes: int
     enable_history_tools: bool
@@ -91,9 +88,6 @@ class NativeConfig:
         mode = str(network_settings.group_reply_mode or "enabled").strip()
         if mode not in {"enabled", "disabled"}:
             raise ValueError("group_reply_mode 必须为 enabled/disabled")
-        style = str(network_settings.group_reply_style or "quote").strip()
-        if style not in {"quote", "mention", "plain"}:
-            raise ValueError("group_reply_style 必须为 quote/mention/plain")
         return cls(
             api_url=url if parsed.path.endswith("/v1") else url + "/v1",
             account_id=account,
@@ -111,7 +105,6 @@ class NativeConfig:
                 str(item).strip() for item in (network_settings.allowed_groups or []) if str(item).strip()
             ),
             group_reply_mode=mode,
-            group_reply_style=style,
             reconnect_delay_seconds=int(settings.reconnect_delay_seconds or 3),
             max_image_bytes=int(media_settings.max_image_mb) * 1024 * 1024,
             enable_history_tools=bool(tool_settings.enable_history_tools),

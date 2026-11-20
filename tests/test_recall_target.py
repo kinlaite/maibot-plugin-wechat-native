@@ -115,7 +115,6 @@ def test_outbound_returns_native_message_id_not_idempotency_key() -> None:
     instance._native = Mock(
         account_id="acct",
         group_reply_mode="plain",
-        group_reply_style="plain",
         max_image_bytes=1024,
     )
     instance._ready = True

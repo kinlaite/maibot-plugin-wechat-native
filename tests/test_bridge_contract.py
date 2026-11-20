@@ -37,11 +37,8 @@ GROUP = "57753723704@chatroom"
 SOURCE = {"threadId": GROUP, "senderId": "wxid_member", "messageId": "m1", "serverId": "555"}
 
 
-def _plugin(style: str = "quote") -> Any:
+def _plugin() -> Any:
     """构造带最小配置的插件实例。
-
-    Args:
-        style: 群回复风格。
 
     Returns:
         Any: 插件实例。
@@ -52,7 +49,6 @@ def _plugin(style: str = "quote") -> Any:
     ctx.message = Mock()
     instance._set_context(ctx)
     native = Mock(
-        group_reply_style=style,
         group_reply_mode="enabled",
         account_id="acct",
     )
@@ -93,10 +89,10 @@ class FakeClient:
 def test_quote_uses_two_distinct_values() -> None:
     """群引用必须同时给出 messageId 与 serverId，不能复用同一个值。"""
 
-    instance = _plugin("quote")
+    instance = _plugin()
     _, _, quote = asyncio.run(
         instance._apply_reply_style(
-            instance._native, FakeClient(), GROUP, [("text", "好")], SOURCE, [], None
+            GROUP, SOURCE, [], "host-msg-id"
         )
     )
     assert quote == {"messageId": "m1", "serverId": "555"}
@@ -105,14 +101,15 @@ def test_quote_uses_two_distinct_values() -> None:
 def test_quote_absent_when_server_id_missing() -> None:
     """缺少 serverId 时不能拼出非法引用参数，应直接放弃引用。"""
 
-    instance = _plugin("quote")
+    instance = _plugin()
     source = {"threadId": GROUP, "senderId": "wxid_member", "messageId": "m1", "serverId": ""}
     _, reply_id, quote = asyncio.run(
         instance._apply_reply_style(
-            instance._native, FakeClient(), GROUP, [("text", "好")], source, [], None
+            GROUP, source, [], "host-msg-id"
         )
     )
     assert quote is None
+    assert reply_id == "host-msg-id"
 
 
 def test_outbound_returns_real_id_for_text_and_media() -> None:
@@ -193,7 +190,7 @@ def test_member_and_message_projection_shapes() -> None:
 
 
 def test_message_projection_strips_mentions_and_maps_types() -> None:
-    """历史消息要把句中 @ 标记去掉，并把类型码翻译成可读名称。"""
+    """历史消息要把类型码翻译成可读名称，正文保持原样。"""
 
     messages = _project_messages(
         {
@@ -205,17 +202,19 @@ def test_message_projection_strips_mentions_and_maps_types() -> None:
         }
     )
     texts = [m["text"] for m in messages["messages"]]
-    assert texts[0] == "那挂个直播吧"
+    # @ 标记属于消息内容，去掉会让模型读错是谁在跟谁说话。
+    assert texts[0] == "那挂个直播吧@ffz\u2005"
     types = [m["type"] for m in messages["messages"]]
     assert types == ["text", "app", "image"]
 
 
 def test_inbound_uses_sender_name_and_quote_author() -> None:
-    """入站消息要带上真实昵称与引用作者，而不是裸 wxid。"""
+    """入站消息要带上真实昵称，引用要作为 reply 段而不是拼进正文。"""
 
     message = inbound(
         {
             "id": "msg_1",
+            "accountId": "acct",
             "threadId": GROUP,
             "senderId": "wxid_a",
             "senderName": "张三",
@@ -226,13 +225,17 @@ def test_inbound_uses_sender_name_and_quote_author() -> None:
         segments=[],
         self_id="wxid_bot",
         group_name="测试群",
-        quote={"text": "原话", "senderName": "李四"},
+        quote={"embeddedText": "原话", "senderName": "李四", "senderId": "wxid_b"},
     )
     info = message["message_info"]
     assert info["user_info"]["user_nickname"] == "张三"
     assert info["group_info"]["group_name"] == "测试群"
-    text = message["raw_message"][0]["data"]
-    assert "李四" in text and "原话" in text
+    reply = message["raw_message"][0]
+    assert reply["type"] == "reply"
+    assert reply["data"]["target_message_content"] == "原话"
+    assert reply["data"]["target_message_sender_nickname"] == "李四"
+    # 正文保持用户原话，不被引用内容污染。
+    assert message["raw_message"][1] == {"type": "text", "data": "在的"}
 
 
 def test_cursor_probe_detects_empty_stream() -> None:
@@ -361,7 +364,14 @@ def test_quoted_image_is_visible_to_model() -> None:
     """被引用的图片要显示为 [图片]，而不是内容不可见。"""
 
     message = inbound(
-        {"id": "m3", "threadId": GROUP, "senderId": "wxid_a", "type": 49, "appMessageType": 57},
+        {
+            "id": "m3",
+            "accountId": "acct",
+            "threadId": GROUP,
+            "senderId": "wxid_a",
+            "type": 49,
+            "appMessageType": 57,
+        },
         "acct",
         text="这是啥",
         segments=[],
@@ -369,8 +379,9 @@ def test_quoted_image_is_visible_to_model() -> None:
         group_name="测试群",
         quote={"type": 3, "embeddedImage": True, "senderName": "等我", "serverId": "1"},
     )
-    text = message["raw_message"][0]["data"]
-    assert "[图片]" in text
+    reply = message["raw_message"][0]
+    assert reply["type"] == "reply"
+    assert reply["data"]["target_message_content"] == "[图片]"
 
 
 def test_at_all_is_parsed_and_exclusive() -> None:
@@ -439,7 +450,6 @@ def test_recall_rejects_thread_outside_allowlist() -> None:
         allowed_users=frozenset(),
         allowed_groups=frozenset(),
         group_reply_mode="enabled",
-        group_reply_style="quote",
         enable_media=False,
         enable_stickers=False,
         reconnect_delay_seconds=1,
@@ -578,6 +588,136 @@ def test_group_mention_sets_is_at_flags() -> None:
     assert plain["is_mentioned"] is False
 
 
+def test_group_mention_of_others_keeps_target() -> None:
+    """@ 别人要变成 at 段，正文原样保留，模型才看得出不是在叫自己。"""
+
+    base = {
+        "id": "m1",
+        "threadId": GROUP,
+        "senderId": "wxid_a",
+        "type": 1,
+    }
+    message = inbound(
+        {
+            **base,
+            "mentions": {"all": False, "self": False, "state": "known", "userIds": ["wxid_other"]},
+        },
+        "acct",
+        text="@乐安\u2005晚上上号吗",
+        segments=[],
+        self_id="wxid_bot",
+        group_name="测试群",
+    )
+    assert message["is_at"] is False
+    assert message["is_mentioned"] is False
+    assert message["raw_message"][0] == {
+        "type": "at",
+        "data": {"target_user_id": "wxid_other", "target_user_nickname": "乐安", "target_user_cardname": None},
+    }
+    assert message["raw_message"][1]["data"] == "晚上上号吗"
+
+
+def test_group_mention_of_others_without_ids_keeps_nickname() -> None:
+    """Native 没给出 @ 目标时保留昵称，不能删掉 @ 变成无主语正文。"""
+
+    message = inbound(
+        {
+            "id": "m1",
+            "threadId": GROUP,
+            "senderId": "wxid_a",
+            "type": 1,
+            "mentions": {"all": False, "self": False, "state": "known", "userIds": []},
+        },
+        "acct",
+        text="@乐安\u2005晚上上号吗",
+        segments=[],
+        self_id="wxid_bot",
+        group_name="测试群",
+    )
+    assert message["is_at"] is False
+    assert message["is_mentioned"] is False
+    assert message["raw_message"] == [{"type": "text", "data": "@乐安 晚上上号吗"}]
+
+
+def test_group_mention_self_becomes_at_segment() -> None:
+    """@ 机器人时同样是 at 段，正文不被剥掉。"""
+
+    message = inbound(
+        {
+            "id": "m1",
+            "threadId": GROUP,
+            "senderId": "wxid_a",
+            "type": 1,
+            "mentions": {"all": False, "self": True, "state": "known", "userIds": ["wxid_bot"]},
+        },
+        "acct",
+        text="让你吃泡面@大肥鱼\u2005",
+        segments=[],
+        self_id="wxid_bot",
+        group_name="测试群",
+    )
+    assert message["is_at"] is True
+    assert message["raw_message"] == [
+        {"type": "text", "data": "让你吃泡面"},
+        {
+            "type": "at",
+            "data": {"target_user_id": "wxid_bot", "target_user_nickname": "大肥鱼", "target_user_cardname": None},
+        },
+    ]
+
+
+def test_group_mention_self_only_is_not_empty() -> None:
+    """只 @ 机器人、没有正文时要留下 at 段，不能产出空消息。"""
+
+    message = inbound(
+        {
+            "id": "m1",
+            "threadId": GROUP,
+            "senderId": "wxid_a",
+            "type": 1,
+            "mentions": {"all": False, "self": True, "state": "known", "userIds": ["wxid_bot"]},
+        },
+        "acct",
+        text="@麦麦92\u2005",
+        segments=[],
+        self_id="wxid_bot",
+        group_name="测试群",
+    )
+    assert message["is_at"] is True
+    assert message["raw_message"] == [
+        {
+            "type": "at",
+            "data": {"target_user_id": "wxid_bot", "target_user_nickname": "麦麦92", "target_user_cardname": None},
+        }
+    ]
+
+
+def test_group_mention_others_only_is_not_empty() -> None:
+    """只 @ 别人、没有正文时至少要留下 at 段，不能是空消息。"""
+
+    message = inbound(
+        {
+            "id": "m1",
+            "threadId": GROUP,
+            "senderId": "wxid_a",
+            "type": 1,
+            "mentions": {"all": False, "self": False, "state": "known", "userIds": ["wxid_other"]},
+        },
+        "acct",
+        text="@乐安\u2005",
+        segments=[],
+        self_id="wxid_bot",
+        group_name="测试群",
+    )
+    assert message["is_at"] is False
+    assert message["raw_message"] == [
+        {
+            "type": "at",
+            "data": {"target_user_id": "wxid_other", "target_user_nickname": "乐安", "target_user_cardname": None},
+        }
+    ]
+
+
 def test_tool_summaries_are_human_readable() -> None:
     """工具返回的 ``content`` 要能直接读给模型，而不是一坨 JSON。
 
@@ -659,8 +799,8 @@ def test_tool_summaries_handle_empty_results() -> None:
     assert _summary_contact_requests({"items": []}).strip()
 
 
-def test_group_summary_drops_announcement_placeholders() -> None:
-    """群公告里的图片占位符与重复行不该进入模型上下文。"""
+def test_group_summary_keeps_announcement_verbatim() -> None:
+    """群公告原样给出，删占位符或去重都会改动群主实际发布的内容。"""
 
     text = _summary_group(
         {
@@ -669,5 +809,5 @@ def test_group_summary_drops_announcement_placeholders() -> None:
             "announcement": "密室\n[图片]\n[图片]\n密室",
         }
     )
-    assert "[图片]" not in text
-    assert text.count("密室") == 1
+    assert "[图片]" in text
+    assert text.count("密室") == 2

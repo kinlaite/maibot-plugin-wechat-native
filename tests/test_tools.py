@@ -104,7 +104,6 @@ def _config(**overrides: Any) -> NativeConfig:
         "allowed_users": frozenset(),
         "allowed_groups": frozenset(),
         "group_reply_mode": "enabled",
-        "group_reply_style": "quote",
         "reconnect_delay_seconds": 3,
         "max_image_bytes": 10 * 1024 * 1024,
         "enable_history_tools": True,

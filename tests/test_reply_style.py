@@ -1,8 +1,13 @@
-"""群聊回复方式（引用 / @ / 直接发送）的行为测试。"""
+"""出站 @ / 引用的翻译测试。
+
+适配器只把宿主已经给出的 at / reply 段翻成 Native 参数，不按自己的策略
+补引用或补 @：那会让微信里发出的消息和模型实际写的内容不一致。
+"""
 
 from typing import Any, Dict, List
 from unittest.mock import Mock
 
+import asyncio
 import os
 import sys
 
@@ -24,7 +29,7 @@ class FakeClient:
         self.calls.append(("text", text, mentions, quote))
 
 
-def _config(style: str, **overrides: Any) -> NativeConfig:
+def _config(**overrides: Any) -> NativeConfig:
     values = {
         "api_url": "http://127.0.0.1:6174/v1",
         "account_id": "acct",
@@ -38,7 +43,6 @@ def _config(style: str, **overrides: Any) -> NativeConfig:
         "allowed_users": frozenset(),
         "allowed_groups": frozenset(),
         "group_reply_mode": "enabled",
-        "group_reply_style": style,
         "reconnect_delay_seconds": 3,
         "max_image_bytes": 10 * 1024 * 1024,
         "enable_history_tools": False,
@@ -51,11 +55,11 @@ def _config(style: str, **overrides: Any) -> NativeConfig:
     return NativeConfig(**values)
 
 
-def _plugin(style: str, source: Dict[str, str]) -> Any:
+def _plugin(source: Dict[str, str]) -> Any:
     instance = plugin_module.WeChatNativePlugin()
     ctx = Mock()
     instance._set_context(ctx)
-    instance._native = _config(style)
+    instance._native = _config()
     instance._self_id = "wxid_bot"
     instance._pending_source = {"acct:" + GROUP + ":m1": source}
     return instance
@@ -64,73 +68,74 @@ def _plugin(style: str, source: Dict[str, str]) -> Any:
 SOURCE = {"threadId": GROUP, "senderId": "wxid_member", "messageId": "m1", "serverId": "555"}
 
 
-def test_quote_style_adds_reference() -> None:
-    instance = _plugin("quote", SOURCE)
+def test_host_reply_request_becomes_native_quote() -> None:
+    """宿主给了 reply 段就引用，配对信息取自触发消息的来源。"""
+
+    instance = _plugin(SOURCE)
     parts = [("text", "好的")]
-    mentions, reply_id, quote = __import__("asyncio").run(
-        instance._apply_reply_style(instance._native, FakeClient(), GROUP, parts, SOURCE, [], None)
-    )
-    assert reply_id == "m1"
-    assert quote == {"messageId": "m1", "serverId": "555"}
-    assert mentions == []
-
-
-def test_mention_style_targets_sender() -> None:
-    instance = _plugin("mention", SOURCE)
-    parts = [("text", "好的")]
-    mentions, reply_id, quote = __import__("asyncio").run(
-        instance._apply_reply_style(instance._native, FakeClient(), GROUP, parts, SOURCE, [], None)
-    )
-    assert mentions == ["wxid_member"]
-    assert quote is None
-
-
-def test_plain_style_adds_nothing() -> None:
-    instance = _plugin("plain", SOURCE)
-    parts = [("text", "好的")]
-    mentions, reply_id, quote = __import__("asyncio").run(
-        instance._apply_reply_style(instance._native, FakeClient(), GROUP, parts, SOURCE, [], None)
+    mentions, reply_id, quote = asyncio.run(
+        instance._apply_reply_style(GROUP, SOURCE, [], "host-msg-id")
     )
     assert mentions == []
-    assert quote is None
+    assert reply_id == SOURCE["messageId"]
+    assert quote == {"messageId": SOURCE["messageId"], "serverId": SOURCE["serverId"]}
 
 
-def test_private_chat_never_adds_reference() -> None:
-    instance = _plugin("quote", SOURCE)
+def test_no_reply_request_means_no_quote() -> None:
+    """宿主没要求引用时不能自己补一个：那是在改写模型发出的消息。"""
+
+    instance = _plugin(SOURCE)
     parts = [("text", "好的")]
-    mentions, reply_id, quote = __import__("asyncio").run(
-        instance._apply_reply_style(instance._native, FakeClient(), "wxid_friend", parts, SOURCE, [], None)
+    mentions, reply_id, quote = asyncio.run(
+        instance._apply_reply_style(GROUP, SOURCE, [], None)
     )
-    assert quote is None
     assert mentions == []
-
-
-def test_media_only_reply_skips_style() -> None:
-    instance = _plugin("quote", SOURCE)
-    parts = [("image", b"data")]
-    mentions, reply_id, quote = __import__("asyncio").run(
-        instance._apply_reply_style(instance._native, FakeClient(), GROUP, parts, SOURCE, [], None)
-    )
+    assert reply_id is None
     assert quote is None
 
 
-def test_explicit_mention_is_preserved() -> None:
-    instance = _plugin("quote", SOURCE)
-    parts = [("text", "@某人 好的")]
-    mentions, reply_id, quote = __import__("asyncio").run(
-        instance._apply_reply_style(instance._native, FakeClient(), GROUP, parts, SOURCE, ["wxid_other"], None)
+def test_host_mentions_are_preserved() -> None:
+    instance = _plugin(SOURCE)
+    parts = [("text", "好的")]
+    mentions, reply_id, quote = asyncio.run(
+        instance._apply_reply_style(GROUP, SOURCE, ["wxid_other"], None)
     )
     assert mentions == ["wxid_other"]
     assert quote is None
 
 
-def test_missing_server_id_falls_back_to_plain() -> None:
-    instance = _plugin("quote", {**SOURCE, "serverId": ""})
+def test_no_implicit_mention_of_trigger_sender() -> None:
+    """没有 at 段时不能自动 @ 触发者。"""
+
+    instance = _plugin(SOURCE)
     parts = [("text", "好的")]
-    mentions, reply_id, quote = __import__("asyncio").run(
-        instance._apply_reply_style(instance._native, FakeClient(), GROUP, parts, {**SOURCE, "serverId": ""}, [], None)
+    mentions, _, _ = asyncio.run(
+        instance._apply_reply_style(GROUP, SOURCE, [], None)
+    )
+    assert mentions == []
+
+
+def test_private_chat_never_quotes() -> None:
+    instance = _plugin(SOURCE)
+    parts = [("text", "好的")]
+    mentions, reply_id, quote = asyncio.run(
+        instance._apply_reply_style("wxid_friend", SOURCE, [], "host-msg-id")
     )
     assert quote is None
+    assert mentions == []
+
+
+def test_missing_server_id_keeps_reply_id_without_quote() -> None:
+    """拼不出 Native 引用参数时只保留 reply_id，不能凭空构造引用。"""
+
+    source = {**SOURCE, "serverId": ""}
+    instance = _plugin(source)
+    parts = [("text", "好的")]
+    mentions, reply_id, quote = asyncio.run(
+        instance._apply_reply_style(GROUP, source, [], "host-msg-id")
+    )
+    assert quote is None
+    assert reply_id == "host-msg-id"
 
 
 def test_reply_source_prefers_host_reply_to_over_latest() -> None:
